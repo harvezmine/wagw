@@ -1,6 +1,6 @@
 # 🚀 WhatsApp Web Gateway API (Node.js + Baileys + PostgreSQL)
 
-WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan arsitektur Multi-Device, penyimpanan data persisten di PostgreSQL, simulasi Anti-Ban Typing Indicator, dan sistem Webhook otomatis sesuai tipe pesan.
+WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) dengan arsitektur Multi-Device, penyimpanan data persisten di PostgreSQL, antrian kirim per nomor, pelacakan status pesan, dan webhook dengan retry + tanda tangan HMAC.
 
 ---
 
@@ -14,7 +14,8 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
    - Mendukung **WhatsApp Pairing Code** (8 digit) untuk pairing tanpa scan kamera.
 3. **Sistem Webhook Sesuai Tipe Pesan**:
    - Mengelompokkan jenis pesan otomatis: `text`, `image`, `video`, `voice`, `document`, `location`, `contact`, `poll`, `sticker`.
-   - Webhook dapat diatur spesifik per session (`device-1`, `device-2`) atau global.
+   - Webhook dapat diatur spesifik per session (`device-1`, `device-2`) atau global, dengan filter event.
+   - Dikirim lewat outbox: retry otomatis dengan backoff, tanda tangan HMAC-SHA256, riwayat delivery bisa dilihat dan di-retry lewat API.
 4. **🛡️ Anti-Ban Humanizer Simulation**:
    - Sebelum pesan dikirim, sistem otomatis mengirim status presence `composing` (mengetik) atau `recording` (merekam audio) dengan jeda waktu natural dinamis berbasis panjang teks.
 5. **Kirim Pesan WhatsApp Lengkap**:
@@ -22,10 +23,13 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
    - Kirim Text Message
    - Kirim Image (URL / Base64 / File Upload multipart)
    - Kirim Document / Attachment PDF/ZIP/dll (URL / File Upload multipart)
-6. **PostgreSQL Database Storage**:
-   - Tabel `sessions`, `baileys_auth_store`, `messages`, dan `webhook_logs`.
-7. **Docker & Docker Compose**:
-   - Siap dideploy dengan satu perintah `docker compose up -d`.
+6. **Antrian Kirim & Status Pesan**:
+   - Semua pesan keluar masuk antrian per nomor dengan jeda acak antar pesan, bisa dijadwalkan (`scheduleAt`), dibatalkan, dijadwal ulang, dan aman dikirim ulang (`idempotencyKey`).
+   - Status `sent` → `delivered` → `read` (atau `failed`) disimpan dan dikirim sebagai webhook `message.status`.
+7. **PostgreSQL Database Storage**:
+   - Tabel `sessions`, `baileys_auth_store`, `messages`, `outbound_messages`, `webhook_deliveries`; skema dikelola migrasi otomatis.
+8. **Docker & Docker Compose**:
+   - Siap dideploy dengan satu perintah `docker compose up -d` (Node 22, user non-root, graceful shutdown).
 
 ---
 
@@ -43,16 +47,22 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
 │   │   └── index.js         # Konfigurasi environment
 │   ├── database/
 │   │   ├── db.js            # PostgreSQL connection pool
-│   │   ├── schema.sql       # Skema DDL tabel
+│   │   ├── migrate.js       # Runner migrasi SQL (otomatis saat start)
+│   │   ├── migrations/      # 001_initial.sql, 002_..., 003_...
 │   │   └── postgresAuthState.js # Baileys Auth Store adapter ke PostgreSQL
 │   ├── services/
 │   │   ├── sessionManager.js # Core Multi-device, Baileys socket, anti-ban presence
 │   │   ├── reconnectPolicy.js # Keputusan reconnect/stop per kode disconnect
-│   │   ├── webhookUrlResolver.js # Resolusi URL webhook per session (dengan cache)
-│   │   └── webhookService.js # Message parser & Webhook dispatcher
+│   │   ├── messageService.js # Submit pesan ke antrian + queue runner
+│   │   ├── outboundQueue.js / queueRunner.js # Antrian kirim (Postgres) & worker per session
+│   │   ├── messageStatus.js # Status pesan & kode error WhatsApp
+│   │   ├── webhookService.js # Message parser & pencatatan event webhook
+│   │   ├── webhookOutbox.js / webhookDispatcher.js # Outbox webhook & pengirim dengan retry
+│   │   └── webhookConfigResolver.js / webhookSigner.js # URL/secret/filter per session & HMAC
 │   ├── controllers/
 │   │   ├── sessionController.js # Handler API session & QR
-│   │   └── messageController.js # Handler API kirim pesan & riwayat
+│   │   ├── messageController.js # Handler API kirim pesan & riwayat
+│   │   └── queueController.js   # Handler API antrian
 │   ├── middlewares/
 │   │   └── auth.js          # API key (header) & signed QR link
 │   ├── utils/               # Validasi, normalisasi nomor, guard SSRF, cache, lock
@@ -61,7 +71,8 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
 │   └── routes/
 │       ├── index.js
 │       ├── sessionRoutes.js
-│       └── messageRoutes.js
+│       ├── messageRoutes.js
+│       └── queueRoutes.js
 └── test/                    # Unit & integration test (node --test)
 ```
 
@@ -107,6 +118,11 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
 5. Jalankan test:
    ```bash
    npm test
+   ```
+   Test database (migrasi, antrian, outbox, auth state) butuh PostgreSQL sekali pakai; setiap file test membuat dan menghapus database sementaranya sendiri:
+   ```bash
+   docker run -d --name wagw-test-pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:56999:5432 postgres:16-alpine
+   DB_TEST=1 DB_HOST=127.0.0.1 DB_PORT=56999 DB_USER=postgres DB_PASSWORD=test DB_NAME=postgres npm test
    ```
 
 ---
@@ -215,6 +231,11 @@ Menghubungkan WhatsApp menggunakan kode 8 digit.
   | `client_version_rejected` | Versi WA Web ditolak (405) | Berhenti; update Baileys atau set `WA_VERSION` |
   | `not_restored` | Session belum di-pair saat server restart | Panggil `init` lagi |
 
+### 4b. Batasan Akun dari WhatsApp
+- **Endpoint**: `GET /api/sessions/:sessionId/limits` (session harus connected)
+- Mengembalikan `newChatMessageCap` (kuota pesan ke chat baru) dan `reachoutTimelock` (`isActive`, `timeEnforcementEnds`, `enforcementType`) langsung dari server WhatsApp. Cek ini sebelum kampanye; kalau `reachoutTimelock.isActive` bernilai `true`, nomor sedang dilarang memulai chat baru (penyebab error 463) dan hanya boleh membalas chat yang sudah ada.
+- Pembatasan yang muncul saat sesi berjalan juga dikirim sebagai webhook `account.restriction`.
+
 ---
 
 ### 5. Kirim Pesan Teks (dengan Anti-Ban Typing Simulation)
@@ -232,7 +253,7 @@ Otomatis mengirim sinyal `composing` (sedang mengetik) selama 1-3 detik sebelum 
   ```
 - **`to`** menerima `08123456789`, `628123456789`, `+62 812-3456-789`, atau JID (`...@s.whatsapp.net`, `...@g.us`, `...@lid`). Awalan `0` diganti `countryCode` (default `62`); kirim `"countryCode": "60"` untuk nomor lokal negara lain, atau `"0"` untuk mematikan konversi.
 - **`delayMs`** (opsional, 0–15000): lama indikator "mengetik". Tanpa `delayMs`, durasi dihitung dari panjang teks.
-- **Error**: `400` input tidak valid, `409` session tidak connected.
+- **Respons**: `200` kalau pesan terkirim dalam `SEND_WAIT_TIMEOUT_MS` (berisi `messageId` dan `queueId`), `202` kalau masih di antrian/terjadwal, `400` input tidak valid, `404` session tidak ada, `409` session tidak connected (kecuali `connectOnly: false`), `502` gagal kirim. Opsi antrian ada di bagian [Antrian Kirim](#-antrian-kirim--status-pesan).
 
 ---
 
@@ -292,6 +313,36 @@ curl "http://localhost:3000/api/messages/device-1/download/ACDCBDA49D620C139EC01
 
 ---
 
+## 📬 Antrian Kirim & Status Pesan
+
+Semua endpoint kirim (`send-text`, `send-image`, `send-attachment`) memasukkan pesan ke tabel `outbound_messages`. Worker mengirim **satu pesan per nomor pada satu waktu** dengan jeda acak `SEND_INTERVAL_MIN_MS`–`SEND_INTERVAL_MAX_MS` (default 2–6 detik) antar pesan; nomor yang berbeda diproses paralel. Pesan pertama pada nomor yang sedang diam langsung terkirim.
+
+Field opsional di body (juga berlaku untuk `multipart/form-data`):
+
+| Field | Default | Keterangan |
+|---|---|---|
+| `async` | `false` | `true` = langsung balas `202` + `queueId` tanpa menunggu pesan terkirim |
+| `scheduleAt` | – | Jadwal kirim: ISO-8601 (`2026-10-03T08:00:00+07:00`) atau unix detik; maksimal 365 hari ke depan |
+| `idempotencyKey` | – | Juga bisa lewat header `Idempotency-Key`. Request ulang dengan key yang sama tidak membuat pesan baru (respons `duplicate: true` + `queueId` yang sama) |
+| `connectOnly` | `true` | `false` = tetap antrikan walau session belum connected; dikirim begitu connect |
+
+- Error sementara (koneksi putus) diulang sampai `QUEUE_MAX_ATTEMPTS` kali; input yang salah (misalnya URL media tidak bisa di-download) langsung `failed`.
+- Pesan yang tertahan lebih dari `QUEUE_MAX_AGE_HOURS` (default 24 jam) karena session offline menjadi `expired`.
+- Kalau server mati tepat saat mengirim, pesan itu ditandai `failed` saat start berikutnya (tidak dikirim ulang, untuk mencegah pesan dobel).
+
+**API antrian** (header `x-api-key`):
+
+| Endpoint | Fungsi |
+|---|---|
+| `GET /api/queue?sessionId=&status=&limit=&offset=` | Daftar pesan di antrian |
+| `GET /api/queue/:queueId` | Detail + status satu pesan |
+| `PATCH /api/queue/:queueId` body `{"scheduleAt": "..."}` | Jadwal ulang (hanya status `queued`; tanpa `scheduleAt` = kirim sekarang) |
+| `DELETE /api/queue/:queueId` | Batalkan (hanya status `queued`) |
+
+**Status**: `queued` → `processing` → `sent` → `delivered` → `read` / `played`, atau `failed` / `cancelled` / `expired`. Status `delivered`/`read` untuk pesan grup tidak dilacak per anggota.
+
+---
+
 ## 🔔 Format Payload Webhook
 
 Ketika ada pesan masuk, gateway otomatis mengirimkan webhook HTTP POST ke `webhookUrl` Anda dengan format JSON:
@@ -304,7 +355,10 @@ Ketika ada pesan masuk, gateway otomatis mengirimkan webhook HTTP POST ke `webho
   "data": {
     "messageId": "3EB0ABC123456789",
     "remoteJid": "628987654321@s.whatsapp.net",
+    "remoteJidAlt": null,
     "senderJid": "628987654321@s.whatsapp.net",
+    "senderJidAlt": null,
+    "senderPhone": "628987654321",
     "fromMe": false,
     "pushName": "Budi Santoso",
     "isGroup": false,
@@ -349,7 +403,73 @@ Event `connection.update` saat koneksi tertutup:
 }
 ```
 
-Perubahan `webhookUrl` lewat `PUT /api/sessions/:sessionId/webhook` langsung berlaku (maksimal 30 detik cache), tanpa restart session.
+Sejak Baileys v7, chat bisa dialamatkan dengan **LID** (`123456789@lid`) dan bukan nomor telepon. Dalam kasus itu nomor telepon (kalau diketahui) ada di `remoteJidAlt` / `senderJidAlt`, dan `senderPhone` selalu berisi nomor pengirim bila tersedia. Balas ke `remoteJid` apa adanya (LID juga valid sebagai tujuan kirim).
+
+Event `message.status` (dari antrian dan tanda terima WhatsApp):
+```json
+{
+  "event": "message.status",
+  "sessionId": "sales-01",
+  "data": {
+    "messageId": "3EB0ABC123456789",
+    "queueId": 42,
+    "remoteJid": "628987654321@s.whatsapp.net",
+    "status": "delivered",
+    "error": null,
+    "timestamp": "2026-10-03T10:00:05.000Z"
+  }
+}
+```
+`status`: `sent`, `delivered`, `read`, `played`, `failed`, `expired`. Untuk `failed` karena penolakan WhatsApp, `error` menjelaskan kodenya, misalnya `WhatsApp error 463: account restricted from starting new chats (...)`.
+
+Event lain: `account.restriction` (data = status reach-out timelock dari WhatsApp).
+
+### Pengiriman, retry & keamanan webhook
+
+- **Antrian (outbox):** setiap event disimpan dulu di tabel `webhook_deliveries`, lalu dikirim di background.
+- **Retry:** untuk HTTP 5xx, 408, 429 dan error jaringan, dengan backoff eksponensial (`WEBHOOK_RETRY_BASE_DELAY_MS` 10 detik s/d 1 jam, maksimal `WEBHOOK_MAX_ATTEMPTS` = 10 kali). Status 4xx lainnya langsung `failed`.
+- **At-least-once:** event yang sama bisa terkirim lebih dari sekali, dan urutan antar-event tidak dijamin. Gunakan header `X-Webhook-Id` untuk dedupe, dan field `timestamp` untuk urutan.
+- **Header yang dikirim:**
+  - `X-Webhook-Id`
+  - `X-Webhook-Event`
+  - `X-Webhook-Timestamp` (unix detik)
+  - `X-Webhook-Attempt`
+  - `X-Webhook-Signature`: hanya kalau ada secret.
+- **Secret:** diambil dari `webhookSecret` per session. Kalau kosong, dipakai `WEBHOOK_SECRET` global (selalu dipakai untuk `GLOBAL_WEBHOOK_URL`).
+
+Verifikasi signature di penerima (Node.js/Express), pakai **raw body**:
+```js
+import crypto from 'node:crypto';
+
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  const timestamp = req.get('X-Webhook-Timestamp');
+  const expected = 'sha256=' + crypto.createHmac('sha256', process.env.WEBHOOK_SECRET)
+    .update(`${timestamp}.${req.body}`).digest('hex');
+  const received = req.get('X-Webhook-Signature') || '';
+  const fresh = Math.abs(Date.now() / 1000 - Number(timestamp)) < 300;
+  if (!fresh || expected.length !== received.length || !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(received))) {
+    return res.sendStatus(401);
+  }
+  const event = JSON.parse(req.body);
+  // ... proses event, dedupe dengan req.get('X-Webhook-Id')
+  res.sendStatus(200);
+});
+```
+
+**Pengaturan webhook per session** — `PUT /api/sessions/:sessionId/webhook` (field yang tidak dikirim tidak berubah; `null`/`""` mengosongkan):
+```json
+{
+  "webhookUrl": "https://your-domain.com/webhook",
+  "webhookSecret": "minimal-16-karakter-acak",
+  "events": ["message.received", "message.status"]
+}
+```
+`events: null` = semua event (`connection.update`, `message.received`, `message.status`, `account.restriction`). Perubahan berlaku maksimal 30 detik kemudian, tanpa restart session.
+
+**Riwayat delivery**:
+- `GET /api/sessions/:sessionId/webhook-deliveries?status=failed`: status, percobaan, kode HTTP, dan error terakhir.
+- `POST /api/sessions/:sessionId/webhook-deliveries/:deliveryId/retry`: kirim ulang delivery yang `failed`.
+- Delivery yang `delivered` dihapus setelah `WEBHOOK_RETENTION_DAYS`; yang `failed` dihapus setelah `WEBHOOK_FAILED_RETENTION_DAYS`.
 
 ---
 
@@ -370,6 +490,20 @@ Lihat `.env.example` untuk daftar lengkap.
 | `MIN_TYPING_DELAY_MS` / `MAX_TYPING_DELAY_MS` | `1000` / `2500` | Rentang durasi indikator "mengetik". |
 | `MAX_REQUEST_DELAY_MS` | `15000` | Batas atas field `delayMs` per request. |
 | `AUTO_READ_MESSAGES` | `false` | Tandai pesan masuk sebagai dibaca (centang biru). |
+| `SEND_INTERVAL_MIN_MS` / `SEND_INTERVAL_MAX_MS` | `2000` / `6000` | Jeda acak antar pesan dari nomor yang sama. |
+| `SEND_WAIT_TIMEOUT_MS` | `60000` | Lama request kirim menunggu hasil sebelum membalas `202`. |
+| `QUEUE_MAX_ATTEMPTS` / `QUEUE_RETRY_DELAY_MS` | `3` / `30000` | Retry kirim untuk error sementara (jeda × nomor percobaan). |
+| `QUEUE_MAX_AGE_HOURS` | `24` | Pesan antrian yang lebih tua dari ini (session offline) menjadi `expired`. |
+| `QUEUE_POLL_MS` | `1000` | Interval worker antrian. |
+| `WEBHOOK_SECRET` | – | Secret HMAC global (≥16 karakter). |
+| `WEBHOOK_TIMEOUT_MS` | `10000` | Timeout per pengiriman webhook. |
+| `WEBHOOK_MAX_ATTEMPTS` | `10` | Maksimal percobaan per event. |
+| `WEBHOOK_RETRY_BASE_DELAY_MS` / `WEBHOOK_RETRY_MAX_DELAY_MS` | `10000` / `3600000` | Backoff retry webhook. |
+| `WEBHOOK_RETENTION_DAYS` / `WEBHOOK_FAILED_RETENTION_DAYS` | `7` / `30` | Retensi riwayat delivery. |
+| `LOG_LEVEL` | `info` | `trace`…`fatal`, atau `silent`. |
+| `LOG_PRETTY` | `true` kecuali production | Log mudah dibaca; di production log berupa JSON per baris. |
+| `BAILEYS_LOG_LEVEL` | `error` | Level log internal Baileys. |
+| `SHUTDOWN_TIMEOUT_MS` | `15000` | Batas waktu graceful shutdown sebelum dipaksa keluar. |
 
 Port PostgreSQL di `docker-compose.yml` hanya di-bind ke `127.0.0.1`.
 
@@ -386,5 +520,37 @@ Di file `.env` / `docker-compose.yml`:
 
 ---
 
+## 🧰 Operasional
+
+- **Migrasi database:**
+  - Dijalankan otomatis saat start, dari `src/database/migrations/*.sql`, dan dicatat di tabel `schema_migrations`.
+  - Database dari versi lama (yang dibuat `schema.sql`) di-upgrade tanpa langkah manual.
+- **Log:** pino. Di production berupa JSON per baris (siap untuk Loki/ELK); atur dengan `LOG_LEVEL`.
+- **Graceful shutdown** (SIGTERM/SIGINT):
+  - Berhenti menerima request dan menyelesaikan pesan yang sedang dikirim.
+  - Menutup socket WhatsApp **tanpa logout**, sehingga session dipulihkan saat start berikutnya.
+  - Menyelesaikan webhook yang sedang terkirim, lalu menutup koneksi DB.
+  - `docker-compose.yml` memberi waktu `stop_grace_period: 30s`.
+- **Docker:** image `node:22-alpine`, `npm ci`, berjalan sebagai user `node`, proses `node` langsung sebagai PID 1.
+- **Satu instance per database:** state socket ada di memori, jadi jangan jalankan dua replica dengan database yang sama.
+
+---
+
+## ⚠️ Perubahan yang Perlu Diperhatikan Klien
+
+- **Autentikasi:** API key hanya lewat header `x-api-key`. `?apiKey=` tidak diterima lagi.
+- **Endpoint kirim:**
+  - Bisa membalas `202` (masih di antrian) selain `200`, dan response menyertakan `queueId`.
+  - Pesan dari nomor yang sama diberi jeda 2–6 detik, sehingga kirim massal lewat API lebih lambat dari sebelumnya (memang disengaja).
+- **Webhook:**
+  - Dikirim asinkron dengan retry, minimal sekali (bisa dobel), dan urutannya tidak dijamin.
+  - Ada header `X-Webhook-*` baru.
+  - Tabel `webhook_logs` tidak diisi lagi (diganti `webhook_deliveries`).
+- **`PUT /api/sessions/:sessionId/webhook`:** field yang tidak dikirim tidak lagi mengosongkan `webhookUrl`.
+- **LID (Baileys v7):** `remoteJid` bisa berupa `...@lid`. Pakai `remoteJidAlt`/`senderPhone` untuk nomor telepon.
+- **`GET /api/sessions/:sessionId/qr`:** tidak lagi menyalakan session; jalankan `POST /api/sessions/init`.
+
+---
+
 ## 📜 Lisensi
-MIT License.
+MIT License. Catatan: Baileys bergantung pada `libsignal` (GPL-3.0). Kalau gateway ini didistribusikan ke pihak lain (bukan hanya dijalankan sebagai layanan), periksa kewajiban lisensi GPL.

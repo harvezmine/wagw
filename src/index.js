@@ -203,11 +203,49 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="card">
+          <h2>🔔 Webhook & Limits</h2>
+          <div class="endpoint">
+            <span class="badge-method badge-put">PUT</span>
+            <span class="path">/api/sessions/:sessionId/webhook</span>
+            <div class="desc">Set <code>webhookUrl</code>, <code>webhookSecret</code> (HMAC) and <code>events</code> filter</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-get">GET</span>
+            <span class="path">/api/sessions/:sessionId/webhook-deliveries</span>
+            <div class="desc">Webhook delivery history (status, attempts, last error); retry with POST .../:deliveryId/retry</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-get">GET</span>
+            <span class="path">/api/sessions/:sessionId/limits</span>
+            <div class="desc">WhatsApp new-chat message cap and reach-out timelock for the account</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>📬 Queue Endpoints</h2>
+          <div class="endpoint">
+            <span class="badge-method badge-get">GET</span>
+            <span class="path">/api/queue?sessionId=&amp;status=</span>
+            <div class="desc">List queued/sent messages; GET /api/queue/:queueId for one message</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-put">PATCH</span>
+            <span class="path">/api/queue/:queueId</span>
+            <div class="desc">Reschedule a queued message (Body: <code>{"scheduleAt": "2026-10-03T08:00:00+07:00"}</code>)</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-delete">DELETE</span>
+            <span class="path">/api/queue/:queueId</span>
+            <div class="desc">Cancel a queued message</div>
+          </div>
+        </div>
+
+        <div class="card">
           <h2>💬 Message Endpoints</h2>
           <div class="endpoint">
             <span class="badge-method badge-post">POST</span>
             <span class="path">/api/messages/send-text</span>
-            <div class="desc">Send text message with simulated typing presence (Body: <code>{"sessionId": "device-1", "to": "628123456789", "text": "Hello!"}</code>)</div>
+            <div class="desc">Queue a text message (Body: <code>{"sessionId": "device-1", "to": "08123456789", "text": "Hello!"}</code>; optional <code>async</code>, <code>scheduleAt</code>, <code>idempotencyKey</code>, <code>connectOnly</code>). 200 when sent, 202 while queued.</div>
           </div>
           <div class="endpoint">
             <span class="badge-method badge-post">POST</span>
