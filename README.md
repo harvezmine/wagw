@@ -16,8 +16,11 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) de
    - Mengelompokkan jenis pesan otomatis: `text`, `image`, `video`, `voice`, `document`, `location`, `contact`, `poll`, `sticker`.
    - Webhook dapat diatur spesifik per session (`device-1`, `device-2`) atau global, dengan filter event.
    - Dikirim lewat outbox: retry otomatis dengan backoff, tanda tangan HMAC-SHA256, riwayat delivery bisa dilihat dan di-retry lewat API.
-4. **🛡️ Anti-Ban Humanizer Simulation**:
-   - Sebelum pesan dikirim, sistem otomatis mengirim status presence `composing` (mengetik) atau `recording` (merekam audio) dengan jeda waktu natural dinamis berbasis panjang teks.
+4. **🛡️ Anti-Ban Guard** (lihat [Anti-Ban Guard](#️-anti-ban-guard)):
+   - Setiap pesan dicek tepat sebelum dikirim: anggaran dan jeda khusus untuk chat baru, masa tenang setelah pairing, jam kampanye, opt-out/opt-in, dan batas frekuensi kampanye.
+   - Patuh pada sinyal WhatsApp: berhenti saat di-ban (402/406), menjeda chat baru saat error 463, reach-out timelock, atau peringatan kuota.
+   - Monitor kesehatan menjeda kampanye otomatis saat tingkat terkirim atau tingkat balasan anjlok.
+   - Simulasi presence `composing`/`recording` sebelum kirim.
 5. **Kirim Pesan WhatsApp Lengkap** (satu endpoint `POST /api/messages/send`):
    - Text, image, video, audio, voice note, document, sticker, lokasi, kontak (vCard), poll.
    - Reply (quote), mention, reaksi, edit, dan hapus pesan.
@@ -239,12 +242,17 @@ Menghubungkan WhatsApp menggunakan kode 8 digit.
   | `forbidden` | Akun diblokir/dibatasi WhatsApp (403) | Berhenti |
   | `multidevice_mismatch` | Perlu pairing ulang (411) | Berhenti |
   | `client_version_rejected` | Versi WA Web ditolak (405) | Berhenti; update Baileys atau set `WA_VERSION` |
+  | `temporarily_banned` | Ban sementara dari WhatsApp (402) | Berhenti; `init` ditolak (`409`) sampai `ban.expiresAt` |
+  | `banned` | Ban dari WhatsApp (406) | Berhenti; auth tidak dihapus (untuk banding) |
+  | `client_rejected` | Klien ditolak WhatsApp (409) | Berhenti |
   | `not_restored` | Session belum di-pair saat server restart | Panggil `init` lagi |
+
+- **`ban`**: `null`, atau `{ permanent, code, expiresAt }` saat `disconnectReason` adalah `banned`/`temporarily_banned`. `code` adalah alasan ban sementara dari WhatsApp, misalnya `101` = terlalu banyak pesan ke orang yang tidak menyimpan nomor ini, `102` = banyak yang memblokir, `104` = pesan yang sama ke terlalu banyak orang.
 
 ### 4b. Batasan Akun dari WhatsApp
 - **Endpoint**: `GET /api/sessions/:sessionId/limits` (session harus connected)
 - Mengembalikan `newChatMessageCap` (kuota pesan ke chat baru) dan `reachoutTimelock` (`isActive`, `timeEnforcementEnds`, `enforcementType`) langsung dari server WhatsApp. Cek ini sebelum kampanye; kalau `reachoutTimelock.isActive` bernilai `true`, nomor sedang dilarang memulai chat baru (penyebab error 463) dan hanya boleh membalas chat yang sudah ada.
-- Pembatasan yang muncul saat sesi berjalan juga dikirim sebagai webhook `account.restriction`.
+- Pembatasan yang muncul saat sesi berjalan juga dikirim sebagai webhook `account.restriction` dan otomatis menjeda chat baru (lihat [Anti-Ban Guard](#️-anti-ban-guard)). Ringkasan lengkapnya ada di `GET /api/sessions/:sessionId/health`.
 
 ---
 
@@ -325,7 +333,7 @@ curl "http://localhost:3000/api/messages/device-1/download/ACDCBDA49D620C139EC01
 
 ## ✉️ Endpoint Kirim Terpadu
 
-`POST /api/messages/send` (JSON, atau `multipart/form-data` dengan field `file` untuk upload media). Semua pesan lewat antrian, jadi opsi `async`, `scheduleAt`, `idempotencyKey`, `connectOnly`, `delayMs`, dan `countryCode` di bagian [Antrian Kirim](#-antrian-kirim--status-pesan) berlaku di sini.
+`POST /api/messages/send` (JSON, atau `multipart/form-data` dengan field `file` untuk upload media). Semua pesan lewat antrian, jadi opsi `async`, `scheduleAt`, `idempotencyKey`, `connectOnly`, `delayMs`, `countryCode`, dan `category` di bagian [Antrian Kirim](#-antrian-kirim--status-pesan) berlaku di sini.
 
 | `type` | Field | Contoh body |
 |---|---|---|
@@ -352,12 +360,13 @@ curl "http://localhost:3000/api/messages/device-1/download/ACDCBDA49D620C139EC01
   "text": "Halo {name}, status member Anda: {var1}"
 }
 ```
-- **Respons:** selalu `202`, berisi hasil per target (`queued`, `duplicate`, `skipped` untuk duplikat dalam request, `invalid`); target yang salah tidak menggagalkan yang lain.
+- **Respons:** `202` kalau ada target yang masuk antrian (`400` kalau tidak ada), berisi hasil per target: `queued`, `duplicate`, `invalid`, atau `skipped` (duplikat dalam request, penerima opt-out, atau kampanye tanpa consent; alasannya di `error`). Target yang ditolak tidak menggagalkan yang lain.
+- **Kategori:** default `campaign`, jadi berlaku aturan kampanye: wajib consent, hanya di jam kampanye, maksimal sekali per penerima per 72 jam.
 - **Batas:** maksimal `BULK_MAX_TARGETS` (500).
 - **Media:** harus berupa `media.url`.
-- **Jeda:** jeda antar pesan per nomor dari antrian tetap berlaku.
+- **Jeda:** jeda antar pesan per nomor dari antrian tetap berlaku; chat baru diberi jeda dan anggaran harian tersendiri.
 
-> Kirim massal ke nomor yang belum pernah chat adalah penyebab ban paling umum. Pakai hanya untuk penerima yang sudah opt-in, dan cek `GET /api/sessions/:sessionId/limits` sebelum kampanye.
+> Kirim massal ke nomor yang belum pernah chat adalah penyebab ban paling umum. Gateway hanya mengizinkan kampanye ke kontak yang pernah menulis atau sudah opt-in; lihat [Anti-Ban Guard](#️-anti-ban-guard).
 
 ---
 
@@ -369,6 +378,7 @@ curl "http://localhost:3000/api/messages/device-1/download/ACDCBDA49D620C139EC01
   - Maksimal `VALIDATE_MAX_NUMBERS` (50) nomor per request.
   - Hasil di-cache `VALIDATE_CACHE_DAYS` (7 hari).
   - Lookup ke WhatsApp dijalankan bergantian per session dengan jeda `VALIDATE_MIN_INTERVAL_MS`, karena lookup kontak massal juga sinyal ban.
+  - Maksimal `VALIDATE_DAILY_LIMIT` (200) nomor yang belum ter-cache per session per 24 jam; lebih dari itu dibalas `429`.
 
 **Grup**:
 - `GET /api/sessions/:sessionId/groups`:
@@ -385,6 +395,9 @@ curl "http://localhost:3000/api/messages/device-1/download/ACDCBDA49D620C139EC01
 | `rejectCalls` | `false` | Tolak panggilan masuk otomatis |
 | `rejectCallMessage` | `null` | Pesan yang dikirim (lewat antrian) ke penelepon yang ditolak |
 | `ignoreGroups` | `false` | Abaikan pesan grup (tidak disimpan, tidak di-webhook) |
+| `newContactDailyLimit` | `null` (ikut `NEW_CONTACT_DAILY_LIMIT`) | Maksimal chat baru per 24 jam (0–1000; `0` = hanya membalas dan kirim ke kontak dikenal) |
+| `campaignConsentRequired` | `null` (ikut `CAMPAIGN_REQUIRE_CONSENT`) | Kampanye hanya ke kontak dikenal atau yang opt-in |
+| `optOutReply` | `null` | Balasan konfirmasi saat seseorang mengirim keyword opt-out |
 
 Panggilan masuk selalu dilaporkan lewat webhook `call.received` (`callId`, `from`, `callerPhone`, `isVideo`, `isGroup`).
 
@@ -417,8 +430,9 @@ curl -X POST http://localhost:3000/api/keys \
 Gateway menyediakan endpoint dengan parameter dan format respons Fonnte di `/fonnte`. Selalu HTTP 200 dengan `status: true/false` dan `reason`, sama seperti Fonnte.
 
 1. Buat API key tenant yang terikat ke **tepat satu** session (session = "device" Fonnte). Key itu dipakai sebagai token Fonnte.
-2. Ganti base URL `https://api.fonnte.com` menjadi `https://gateway-anda/fonnte`. Header `Authorization: <token>` tetap sama; beberapa token dipisah koma akan dirotasi antar session.
+2. Ganti base URL `https://api.fonnte.com` menjadi `https://gateway-anda/fonnte`. Header `Authorization: <token>` tetap sama. Dengan beberapa token dipisah koma, setiap penerima selalu dikirimi dari nomor yang sudah punya percakapan dengannya (tanpa pindah ke nomor lain saat nomor itu offline); penerima baru dibagi dengan hash tetap, bukan acak.
 3. Opsional: `PUT /api/sessions/:sessionId/webhook` dengan `"format": "fonnte"` supaya payload webhook (pesan masuk, status pesan, connect/disconnect) berbentuk seperti Fonnte.
+4. Kirim ke lebih dari satu target dianggap `campaign` (wajib consent, jam kampanye); satu target dianggap `transactional`. Parameter `category` mengubahnya. Target yang opt-out dilewati; kalau semua ditolak, respons `status: false` dengan alasannya.
 
 | Endpoint Fonnte | Didukung | Catatan |
 |---|---|---|
@@ -449,10 +463,13 @@ Field opsional di body (juga berlaku untuk `multipart/form-data`):
 | `scheduleAt` | – | Jadwal kirim: ISO-8601 (`2026-10-03T08:00:00+07:00`) atau unix detik; maksimal 365 hari ke depan |
 | `idempotencyKey` | – | Juga bisa lewat header `Idempotency-Key`. Request ulang dengan key yang sama tidak membuat pesan baru (respons `duplicate: true` + `queueId` yang sama) |
 | `connectOnly` | `true` | `false` = tetap antrikan walau session belum connected; dikirim begitu connect |
+| `category` | `transactional` (satu penerima) / `campaign` (massal) | `transactional`, `campaign`, atau `reply`; menentukan aturan [Anti-Ban Guard](#️-anti-ban-guard) yang berlaku |
 
 - Error sementara (koneksi putus) diulang sampai `QUEUE_MAX_ATTEMPTS` kali; input yang salah (misalnya URL media tidak bisa di-download) langsung `failed`.
 - Pesan yang tertahan lebih dari `QUEUE_MAX_AGE_HOURS` (default 24 jam) karena session offline menjadi `expired`.
 - Kalau server mati tepat saat mengirim, pesan itu ditandai `failed` saat start berikutnya (tidak dikirim ulang, untuk mencegah pesan dobel).
+- Pesan yang **ditahan** oleh Anti-Ban Guard tetap `queued`, dengan `deferredUntil` dan alasan di `error`. Penahanan tidak memakai jatah retry, dan pesan tetap menjadi `expired` kalau tertahan lebih dari `QUEUE_MAX_AGE_HOURS` setelah jadwalnya. Request yang menunggu hasil langsung dibalas `202` dengan `deferredUntil` dan `reason`.
+- Pesan yang **dilewati** oleh guard (penerima opt-out, tidak terdaftar di WhatsApp, kampanye berulang) berstatus `skipped`; request yang menunggu hasil dibalas `409`.
 
 **API antrian** (header `x-api-key`):
 
@@ -463,7 +480,7 @@ Field opsional di body (juga berlaku untuk `multipart/form-data`):
 | `PATCH /api/queue/:queueId` body `{"scheduleAt": "..."}` | Jadwal ulang (hanya status `queued`; tanpa `scheduleAt` = kirim sekarang) |
 | `DELETE /api/queue/:queueId` | Batalkan (hanya status `queued`) |
 
-**Status**: `queued` → `processing` → `sent` → `delivered` → `read` / `played`, atau `failed` / `cancelled` / `expired`. Status `delivered`/`read` untuk pesan grup tidak dilacak per anggota.
+**Status**: `queued` → `processing` → `sent` → `delivered` → `read` / `played`, atau `failed` / `cancelled` / `expired` / `skipped`. Setiap item juga punya `category` dan `newContact` (apakah pesan ini membuka chat baru). Status `delivered`/`read` untuk pesan grup tidak dilacak per anggota.
 
 ---
 
@@ -544,9 +561,9 @@ Event `message.status` (dari antrian dan tanda terima WhatsApp):
   }
 }
 ```
-`status`: `sent`, `delivered`, `read`, `played`, `failed`, `expired`. Untuk `failed` karena penolakan WhatsApp, `error` menjelaskan kodenya, misalnya `WhatsApp error 463: account restricted from starting new chats (...)`.
+`status`: `sent`, `delivered`, `read`, `played`, `failed`, `expired`, `skipped`. Untuk `failed` karena penolakan WhatsApp, `error` menjelaskan kodenya, misalnya `WhatsApp error 463: account restricted from starting new chats (...)`; untuk `skipped`, `error` berisi alasan dari Anti-Ban Guard.
 
-Event lain: `account.restriction` (data = status reach-out timelock dari WhatsApp) dan `call.received` (panggilan masuk).
+Event lain: `call.received` (panggilan masuk), serta event Anti-Ban Guard `account.restriction`, `account.banned`, `session.paused`, dan `contact.consent` (lihat [Anti-Ban Guard](#️-anti-ban-guard)).
 
 ### Pengiriman, retry & keamanan webhook
 
@@ -588,7 +605,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   "events": ["message.received", "message.status"]
 }
 ```
-`events: null` = semua event (`connection.update`, `message.received`, `message.status`, `account.restriction`, `call.received`). Field `format`: `"default"` atau `"fonnte"` (lihat [Migrasi dari Fonnte](#-migrasi-dari-fonnte)). Perubahan berlaku maksimal 30 detik kemudian, tanpa restart session.
+`events: null` = semua event (`connection.update`, `message.received`, `message.status`, `account.restriction`, `account.banned`, `session.paused`, `contact.consent`, `call.received`). Field `format`: `"default"` atau `"fonnte"` (lihat [Migrasi dari Fonnte](#-migrasi-dari-fonnte)). Perubahan berlaku maksimal 30 detik kemudian, tanpa restart session.
 
 **Riwayat delivery**:
 - `GET /api/sessions/:sessionId/webhook-deliveries?status=failed`: status, percobaan, kode HTTP, dan error terakhir.
@@ -631,20 +648,159 @@ Lihat `.env.example` untuk daftar lengkap.
 | `TRUST_PROXY` | – | Setting Express `trust proxy` (`1`, `true`, `loopback`, …) agar IP klien benar di belakang reverse proxy. |
 | `BULK_MAX_TARGETS` | `500` | Maksimal target per request kirim massal. |
 | `VALIDATE_MAX_NUMBERS` / `VALIDATE_MIN_INTERVAL_MS` / `VALIDATE_CACHE_DAYS` | `50` / `3000` / `7` | Batas, throttle, dan cache validasi nomor. |
+| `VALIDATE_DAILY_LIMIT` | `200` | Maksimal nomor yang belum ter-cache per session per 24 jam (validasi + cek otomatis chat baru). |
 | `GROUPS_CACHE_MINUTES` | `10` | Umur cache daftar grup. |
 
-Port PostgreSQL di `docker-compose.yml` hanya di-bind ke `127.0.0.1`.
+Variabel Anti-Ban Guard ada di bagian [Anti-Ban Guard](#️-anti-ban-guard). Port PostgreSQL di `docker-compose.yml` hanya di-bind ke `127.0.0.1`.
 
 ---
 
-## 🛡️ Pengaturan Anti-Ban & Human Simulation
+## 🛡️ Anti-Ban Guard
 
-Di file `.env` / `docker-compose.yml`:
-- `MIN_TYPING_DELAY_MS=1200` (Jeda minimal mengetik sebelum kirim pesan)
-- `MAX_TYPING_DELAY_MS=3000` (Jeda maksimal mengetik)
-- `AUTO_READ_MESSAGES=true` (Otomatis menandai pesan masuk sebagai telah dibaca / centang biru)
+WhatsApp membatasi dan mem-ban nomor terutama karena **perilaku**:
+- memulai banyak chat ke orang yang tidak menyimpan nomor kita;
+- mengirim pesan yang sama ke banyak orang;
+- banyak penerima yang memblokir atau melaporkan;
+- tetap memaksa kirim saat nomor sudah dibatasi.
 
-> Catatan: indikator mengetik hanya sinyal lemah. Yang paling berpengaruh terhadap ban adalah kecepatan kirim, mengirim ke nomor yang belum pernah chat, dan laporan spam dari penerima.
+Guard ini mengatur perilaku tersebut. Gateway **tidak** menyamarkan diri: tidak ada spoofing fingerprint, rotasi proxy/IP, spintax, atau rotasi nomor untuk mengakali batas. Tidak ada yang bisa menjamin nomor tidak di-ban; tujuannya menurunkan risikonya serendah mungkin. Angka default adalah heuristik konservatif, bukan angka resmi WhatsApp.
+
+**Istilah:**
+- **Kontak dikenal:** penerima yang pernah mengirim pesan 1:1 ke nomor ini (dicocokkan lewat nomor maupun LID).
+- **Chat baru:** kirim ke penerima yang belum dikenal. Inilah yang dihitung kuota WhatsApp dan memicu error 463 serta ban sementara kode 101.
+- **Kategori pesan** (field `category` di semua endpoint kirim):
+
+  | Kategori | Default untuk | Contoh |
+  |---|---|---|
+  | `transactional` | Kirim ke satu penerima | OTP, notifikasi pesanan |
+  | `campaign` | Kirim massal, Fonnte multi-target | Promo, broadcast |
+  | `reply` | — | Jawaban dalam percakapan aktif (penerima menulis < 24 jam lalu) |
+
+### Gerbang kirim
+
+Setiap pesan dicek tepat sebelum dikirim. Aturan dievaluasi berurutan; aturan pertama yang cocok menentukan hasilnya:
+- **kirim** — pesan dikirim sekarang;
+- **tahan** — tetap `queued` sampai waktu tertentu (`deferredUntil`);
+- **lewati** — status final `skipped`.
+
+| # | Berlaku untuk | Aturan | Hasil |
+|---|---|---|---|
+| 0 | reaction / edit / delete | Bekerja pada chat yang sudah ada | kirim |
+| 1 | Semua (bukan grup) | Penerima opt-out (kecuali `reply` dalam percakapan aktif) | lewati |
+| 2 | `campaign` | Penerima bukan kontak dikenal dan belum opt-in (`CAMPAIGN_REQUIRE_CONSENT`) | lewati |
+| 3 | `campaign` | Kampanye session sedang dijeda monitor kesehatan | tahan sampai jeda selesai |
+| 4 | `campaign` | Di luar `CAMPAIGN_HOURS` (08:00–20:00 `CAMPAIGN_TIMEZONE`) | tahan sampai jam buka |
+| 5 | `campaign` | Penerima sudah menerima kampanye dalam `CAMPAIGN_RECIPIENT_COOLDOWN_HOURS` (72 jam) | lewati |
+| 6 | Kontak dikenal / grup | — | kirim |
+| 7 | Chat baru | Chat baru dijeda karena sinyal WhatsApp (463, timelock, kuota) | tahan |
+| 8 | Chat baru | Masa tenang setelah pairing (`NEW_SESSION_COOLDOWN_HOURS`, 72 jam): nomor baru hanya membalas dan kirim ke kontak dikenal | tahan |
+| 9 | Chat baru | Baru (re)connect (`RECONNECT_WARMUP_MS`, 2 menit) | tahan |
+| 10 | Chat baru | Kuota chat baru WhatsApp habis | tahan sampai siklus berakhir |
+| 11 | Chat baru | Anggaran harian `NEW_CONTACT_DAILY_LIMIT` (20 per 24 jam bergulir) habis | tahan sampai ada slot |
+| 12 | Chat baru | Jeda antar chat baru `NEW_CONTACT_INTERVAL_MIN_MS`–`MAX_MS` (60–180 detik, acak) | tahan |
+| 13 | Chat baru | Nomor tidak terdaftar di WhatsApp (cek ber-cache, `VALIDATE_NEW_CONTACTS`) | lewati |
+| 14 | — | Lolos semua aturan | kirim |
+
+Opt-out dan kampanye tanpa consent juga sudah ditolak saat request masuk: kirim tunggal dibalas `409 Not sent: <alasan>`, kirim massal memberi hasil `skipped` per target.
+
+### Persetujuan (consent)
+
+- **Opt-out:**
+  - Pesan 1:1 yang isinya persis salah satu `OPT_OUT_KEYWORDS` (tidak case-sensitive, tanda baca di akhir diabaikan; `stop!` cocok, `jangan stop dulu` tidak), atau lewat API.
+  - Memblokir kampanye sampai orang itu opt-in lagi. Pesan lain diblokir sampai orang itu menulis lagi.
+  - Setting `optOutReply` dikirim sekali sebagai konfirmasi.
+- **Opt-in:** pesan `OPT_IN_KEYWORDS` (`START`, …), atau import lewat API (misalnya dari formulir pendaftaran).
+- **Kampanye** hanya ke kontak dikenal atau yang sudah opt-in. Bisa dimatikan per session dengan `campaignConsentRequired: false`, tapi tidak disarankan.
+
+| Endpoint | Fungsi |
+|---|---|
+| `PUT /api/sessions/:sessionId/consents` body `{"numbers": ["0812...", "0813..."], "status": "opted_in"}` | Import opt-in / catat opt-out (maks 1000 nomor per request) |
+| `GET /api/sessions/:sessionId/consents?status=opted_out&limit=100&offset=0` | Daftar consent |
+| `DELETE /api/sessions/:sessionId/consents/:nomor` | Hapus catatan (dianggap belum pernah ditanya) |
+
+### Reaksi terhadap sinyal WhatsApp
+
+| Sinyal | Tindakan gateway |
+|---|---|
+| Pesan gagal dengan error 463 | Cek reach-out timelock ke WhatsApp. Kalau timelock tidak aktif atau gagal dicek, chat baru dijeda `RESTRICTION_PAUSE_HOURS` (24 jam). Pesan tidak pernah diulang, karena mengulang juga dihitung sebagai upaya baru. |
+| Reach-out timelock aktif | Chat baru dijeda sampai `timeEnforcementEnds`; jeda dicabut otomatis saat WhatsApp mencabut timelock |
+| Kuota chat baru `FIRST_WARNING` / `SECOND_WARNING` / `CAPPED` | Chat baru dijeda sampai siklus kuota berakhir; dicabut saat status kembali `NONE` |
+| Koneksi ditolak 402 (ban sementara) | Session berhenti tanpa reconnect, webhook `account.banned`, `init` ditolak sampai ban berakhir |
+| Koneksi ditolak 406 (ban) / 409 | Session berhenti tanpa reconnect; auth tidak dihapus |
+| Pairing baru | Masa tenang dimulai (aturan 8); logout menghapus status guard nomor itu |
+
+Selama jeda chat baru, membalas dan kirim ke kontak dikenal tetap berjalan normal.
+
+### Monitor kesehatan
+
+Setiap `HEALTH_CHECK_INTERVAL_MS` (10 menit), untuk setiap session yang connected:
+- **Kuota WhatsApp:** diperbarui setiap `CAP_POLL_HOURS` (6 jam). WhatsApp juga mengirim perubahannya sendiri.
+- **Kampanye dijeda** `HEALTH_PAUSE_HOURS` (24 jam) kalau, dari minimal `HEALTH_MIN_SAMPLE` (20) pesan:
+  - tingkat terkirim pesan 1:1 (dikirim 2–24 jam lalu) di bawah `HEALTH_MIN_DELIVERY_RATE` (60%); atau
+  - tingkat balasan chat baru kampanye (dikirim 1–7 hari lalu) di bawah `HEALTH_MIN_REPLY_RATE` (5%).
+
+  Ini meniru cara Meta menjeda template berkualitas rendah: banyak pesan tak terkirim atau tak dibalas biasanya berarti banyak blokir dan laporan. Setelah jeda berakhir, hanya pesan yang dikirim sesudahnya yang dinilai.
+
+**`GET /api/sessions/:sessionId/health`** — ringkasan guard:
+```json
+{
+  "success": true,
+  "sessionId": "sales-01",
+  "status": "connected",
+  "ban": null,
+  "pauses": {
+    "newChats": { "until": "2026-10-04T05:00:00.000Z", "reason": "whatsapp_error_463: WhatsApp refused to start a new chat", "byWhatsApp": true },
+    "campaigns": null
+  },
+  "coolDown": { "pairedAt": "2026-09-01T03:00:00.000Z", "endsAt": "2026-09-04T03:00:00.000Z", "active": false },
+  "warmUp": { "connectedAt": "2026-10-03T04:00:00.000Z", "endsAt": "2026-10-03T04:02:00.000Z", "active": false },
+  "newChats": { "last24h": 7, "dailyLimit": 20, "remaining": 13, "lastAt": "2026-10-03T04:40:00.000Z" },
+  "whatsappQuota": { "total": 150, "used": 42, "status": "NONE", "cycleStart": "...", "cycleEnd": "...", "updatedAt": "..." },
+  "campaignHours": { "window": "08:00-20:00", "timezone": "Asia/Jakarta", "openNow": true },
+  "metrics": { "deliverySample": 120, "delivered": 113, "deliveryRate": 0.94, "replySample": 35, "replied": 6, "replyRate": 0.17 },
+  "canStartNewChats": false
+}
+```
+
+**`POST /api/sessions/:sessionId/health/resume`** body `{"scope": "campaigns"}` (atau `"new_chats"`):
+- Mencabut jeda dari monitor kesehatan.
+- Jeda dari WhatsApp (`byWhatsApp: true`) ditolak `409` sampai berakhir, karena tetap mengirim saat dibatasi itulah yang berujung ban.
+
+### Webhook Anti-Ban Guard
+
+| Event | Data |
+|---|---|
+| `account.restriction` | `source`: `reachout_timelock` (`isActive`, `timeEnforcementEnds`, `enforcementType`), `error_463` (`isActive`, `pausedUntil`), atau `chat_cap` (`total`, `used`, `status`, `cycleStart`, `cycleEnd`) |
+| `account.banned` | `permanent`, `code`, `reason`, `expiresAt` |
+| `session.paused` | `scope` (`new_chats` / `campaigns`), `until`, `reason` — hanya saat jeda baru atau diperpanjang |
+| `contact.consent` | `jid`, `jids` (nomor + LID), `status` (`opted_in` / `opted_out`), `source` (`keyword`) |
+
+Event ini tidak dikirim dalam format webhook Fonnte.
+
+### Konfigurasi
+
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `NEW_CONTACT_DAILY_LIMIT` | `20` | Chat baru per session per 24 jam bergulir (bisa diubah per session) |
+| `NEW_CONTACT_INTERVAL_MIN_MS` / `NEW_CONTACT_INTERVAL_MAX_MS` | `60000` / `180000` | Jeda acak antar chat baru |
+| `NEW_SESSION_COOLDOWN_HOURS` | `72` | Masa tenang setelah pairing (session yang sudah di-pair sebelum fitur ini tidak terkena) |
+| `RECONNECT_WARMUP_MS` | `120000` | Jeda chat baru setelah (re)connect |
+| `RESTRICTION_PAUSE_HOURS` | `24` | Lama jeda chat baru setelah error 463 tanpa info timelock |
+| `CAMPAIGN_HOURS` / `CAMPAIGN_TIMEZONE` | `08:00-20:00` / `Asia/Jakarta` | Jam kirim kampanye (boleh melewati tengah malam, misal `22:00-06:00`) |
+| `CAMPAIGN_RECIPIENT_COOLDOWN_HOURS` | `72` | Jarak minimal antar kampanye ke penerima yang sama |
+| `CAMPAIGN_REQUIRE_CONSENT` | `true` | Kampanye hanya ke kontak dikenal atau opt-in |
+| `OPT_OUT_KEYWORDS` | `STOP,BERHENTI,UNSUBSCRIBE,UNSUB,STOP PROMO,BERHENTI PROMO` | Keyword opt-out (dipisah koma) |
+| `OPT_IN_KEYWORDS` | `START,SUBSCRIBE,LANGGANAN` | Keyword opt-in |
+| `VALIDATE_NEW_CONTACTS` | `true` | Cek nomor terdaftar sebelum membuka chat baru |
+| `CAP_POLL_HOURS` | `6` | Interval cek kuota chat baru WhatsApp |
+| `HEALTH_CHECK_INTERVAL_MS` | `600000` | Interval monitor kesehatan |
+| `HEALTH_MIN_SAMPLE` | `20` | Sampel minimal sebelum monitor boleh menjeda |
+| `HEALTH_MIN_DELIVERY_RATE` / `HEALTH_MIN_REPLY_RATE` | `0.6` / `0.05` | Ambang tingkat terkirim / balasan |
+| `HEALTH_PAUSE_HOURS` | `24` | Lama jeda kampanye dari monitor |
+
+### Simulasi mengetik
+
+Sebelum kirim, gateway mengirim presence `composing` (atau `recording` untuk voice note) selama `MIN_TYPING_DELAY_MS`–`MAX_TYPING_DELAY_MS`, tergantung panjang teks. Ini hanya sinyal lemah; yang menentukan adalah aturan di atas.
 
 ---
 
@@ -677,6 +833,16 @@ Di file `.env` / `docker-compose.yml`:
 - **`PUT /api/sessions/:sessionId/webhook`:** field yang tidak dikirim tidak lagi mengosongkan `webhookUrl`.
 - **LID (Baileys v7):** `remoteJid` bisa berupa `...@lid`. Pakai `remoteJidAlt`/`senderPhone` untuk nomor telepon.
 - **`GET /api/sessions/:sessionId/qr`:** tidak lagi menyalakan session; jalankan `POST /api/sessions/init`.
+- **Anti-Ban Guard** (lihat [Anti-Ban Guard](#️-anti-ban-guard)):
+  - Nomor yang baru di-pair hanya bisa membalas dan kirim ke kontak dikenal selama 72 jam; chat baru menunggu.
+  - Chat baru dibatasi 20 per 24 jam per nomor, dengan jeda 1–3 menit; sisanya tertahan di antrian (`deferredUntil`).
+  - Kirim massal default-nya `campaign`: hanya ke kontak dikenal atau yang opt-in, hanya 08:00–20:00 WIB, maksimal sekali per penerima per 72 jam. Kirim satu penerima tetap `transactional`.
+  - Penerima yang mengirim `STOP`/`BERHENTI` tidak dikirimi lagi (`409` / `skipped`).
+  - Status antrian baru `skipped`; event webhook baru `account.banned`, `session.paused`, `contact.consent`; payload `account.restriction` kini punya `source`.
+  - Target `status@broadcast` / `...@broadcast` ditolak `400`.
+  - 402/406 tidak lagi di-reconnect; `init` ditolak selama ban sementara.
+  - Fonnte dengan beberapa token: penerima tidak lagi dirotasi acak, tapi tetap di nomor yang pernah chat dengannya.
+  - Lookup nomor yang belum ter-cache dibatasi 200 per session per 24 jam (`429`).
 
 ---
 

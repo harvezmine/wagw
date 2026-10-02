@@ -148,7 +148,7 @@ app.get('/', (req, res) => {
       <div class="container">
         <div class="header">
           <h1>🟢 WhatsApp Gateway API</h1>
-          <p>Multi-Device • Baileys Engine • PostgreSQL Persistence • Anti-Ban Simulation • Webhooks</p>
+          <p>Multi-Device • Baileys Engine • PostgreSQL Persistence • Anti-Ban Guard • Webhooks</p>
         </div>
 
         <div class="features-grid">
@@ -157,8 +157,8 @@ app.get('/', (req, res) => {
             Manage multiple WhatsApp numbers concurrently with individual sessions.
           </div>
           <div class="feature-box">
-            <strong>🛡️ Anti-Ban Humanizer</strong>
-            Simulates natural typing & recording presence delays before sending messages.
+            <strong>🛡️ Anti-Ban Guard</strong>
+            Budget and spacing for new chats, pairing cool-down, campaign hours, opt-out/opt-in, and pauses that follow WhatsApp's own restriction signals.
           </div>
           <div class="feature-box">
             <strong>🔔 Dynamic Webhooks</strong>
@@ -236,6 +236,16 @@ app.get('/', (req, res) => {
             <span class="path">/api/sessions/:sessionId/limits</span>
             <div class="desc">WhatsApp new-chat message cap and reach-out timelock for the account</div>
           </div>
+          <div class="endpoint">
+            <span class="badge-method badge-get">GET</span>
+            <span class="path">/api/sessions/:sessionId/health</span>
+            <div class="desc">Anti-Ban Guard state: pauses, cool-down, daily new-chat budget, WhatsApp quota, delivery and reply rates; POST .../health/resume lifts gateway pauses</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-put">PUT</span>
+            <span class="path">/api/sessions/:sessionId/consents</span>
+            <div class="desc">Import opt-ins or record opt-outs (Body: <code>{"numbers": [...], "status": "opted_in"}</code>); GET to list, DELETE .../consents/:number to forget</div>
+          </div>
         </div>
 
         <div class="card">
@@ -262,7 +272,7 @@ app.get('/', (req, res) => {
           <div class="endpoint">
             <span class="badge-method badge-post">POST</span>
             <span class="path">/api/messages/send</span>
-            <div class="desc">Every message type (text, image, video, audio, voice, document, sticker, location, contact, poll, reaction, edit, delete) with <code>replyTo</code>/<code>mentions</code>; several targets with <code>{name}</code>/<code>{var1}</code> templating</div>
+            <div class="desc">Every message type (text, image, video, audio, voice, document, sticker, location, contact, poll, reaction, edit, delete) with <code>replyTo</code>/<code>mentions</code>; several targets with <code>{name}</code>/<code>{var1}</code> templating; <code>category</code> transactional / campaign / reply</div>
           </div>
           <div class="endpoint">
             <span class="badge-method badge-post">POST</span>
@@ -277,7 +287,7 @@ app.get('/', (req, res) => {
           <div class="endpoint">
             <span class="badge-method badge-put">PATCH</span>
             <span class="path">/api/sessions/:sessionId/settings</span>
-            <div class="desc">readMessages, rejectCalls, rejectCallMessage, ignoreGroups</div>
+            <div class="desc">readMessages, rejectCalls, rejectCallMessage, ignoreGroups, newContactDailyLimit, campaignConsentRequired, optOutReply</div>
           </div>
         </div>
 
