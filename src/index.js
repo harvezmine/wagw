@@ -7,6 +7,7 @@ import apiRoutes from './routes/index.js';
 import { logger } from './utils/logger.js';
 import { outboundQueue } from './services/outboundQueue.js';
 import { queueRunner } from './services/messageService.js';
+import { webhookDispatcher } from './services/webhookService.js';
 
 const app = express();
 
@@ -270,6 +271,7 @@ async function startServer() {
     logger.info('Restoring previously active WhatsApp sessions');
     await restoreSessions();
     queueRunner.start();
+    webhookDispatcher.start();
 
     app.listen(config.port, config.host, () => {
       logger.info({ url: `http://${config.host}:${config.port}`, docs: `http://localhost:${config.port}/` }, 'WhatsApp Web Gateway is running');

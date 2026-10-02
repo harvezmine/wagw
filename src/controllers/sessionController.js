@@ -6,12 +6,14 @@ import {
   requestPairingCode as requestPairingCodeService,
   logoutSession,
   deleteSession as deleteSessionService,
-  setSessionWebhookUrl
+  setSessionWebhookConfig
 } from '../services/sessionManager.js';
+import { webhookOutbox } from '../services/webhookOutbox.js';
+import { webhookDispatcher } from '../services/webhookService.js';
 import { createQrLinkToken } from '../middlewares/auth.js';
 import { config } from '../config/index.js';
 import { AppError, sendError } from '../utils/errors.js';
-import { assertSessionId } from '../utils/validation.js';
+import { assertSessionId, parseOptionalInt } from '../utils/validation.js';
 import { renderConnectedPage, renderInitializingPage, renderMessagePage, renderQrPage } from '../views/sessionPages.js';
 
 /**
@@ -172,13 +174,65 @@ export async function listSessions(req, res) {
 export async function updateWebhook(req, res) {
   try {
     const { sessionId } = req.params;
-    const webhookUrl = await setSessionWebhookUrl(sessionId, req.body.webhookUrl);
+    const { webhookUrl, webhookSecret, events } = req.body;
+    const webhook = await setSessionWebhookConfig(sessionId, { webhookUrl, webhookSecret, events });
 
     return res.status(200).json({
       success: true,
       message: `Webhook updated for session ${sessionId}`,
-      webhookUrl
+      ...webhook
     });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+const DELIVERY_STATUSES = ['pending', 'delivered', 'failed'];
+
+function formatDelivery(row) {
+  return {
+    deliveryId: Number(row.id),
+    event: row.event_type,
+    status: row.status,
+    attempts: row.attempts,
+    nextAttemptAt: row.status === 'pending' ? row.next_attempt_at : null,
+    lastUrl: row.last_url,
+    lastStatusCode: row.last_status_code,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    deliveredAt: row.delivered_at,
+    payload: row.payload
+  };
+}
+
+export async function listWebhookDeliveries(req, res) {
+  try {
+    const { sessionId } = req.params;
+    const { status } = req.query;
+    if (status && !DELIVERY_STATUSES.includes(status)) {
+      throw new AppError(400, `status must be one of: ${DELIVERY_STATUSES.join(', ')}.`);
+    }
+    const deliveries = await webhookOutbox.list({
+      sessionId,
+      status: status || null,
+      limit: parseOptionalInt(req.query.limit, { name: 'limit', min: 1, max: 200, defaultValue: 50 }),
+      offset: parseOptionalInt(req.query.offset, { name: 'offset', min: 0, max: Number.MAX_SAFE_INTEGER, defaultValue: 0 })
+    });
+    return res.status(200).json({ success: true, count: deliveries.length, deliveries: deliveries.map(formatDelivery) });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function retryWebhookDelivery(req, res) {
+  try {
+    const { sessionId } = req.params;
+    const deliveryId = parseOptionalInt(req.params.deliveryId, { name: 'deliveryId', min: 1, max: Number.MAX_SAFE_INTEGER });
+    if (!(await webhookOutbox.retry(deliveryId, sessionId))) {
+      throw new AppError(404, `No failed delivery ${deliveryId} for session "${sessionId}".`);
+    }
+    webhookDispatcher.wake();
+    return res.status(200).json({ success: true, deliveryId, status: 'pending' });
   } catch (error) {
     return sendError(res, error, 'SessionController');
   }

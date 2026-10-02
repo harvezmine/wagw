@@ -1,16 +1,37 @@
-import axios from 'axios';
 import { query } from '../database/db.js';
 import { config } from '../config/index.js';
-import { createWebhookUrlResolver } from './webhookUrlResolver.js';
-import { assertSafeUrl, safeRequestOptions } from '../utils/netGuard.js';
+import { logger } from '../utils/logger.js';
+import { createWebhookConfigResolver } from './webhookConfigResolver.js';
+import { webhookOutbox } from './webhookOutbox.js';
+import { createWebhookDispatcher, createWebhookPoster } from './webhookDispatcher.js';
 
-const webhookUrlResolver = createWebhookUrlResolver({ query, globalWebhookUrl: config.globalWebhookUrl });
+export const WEBHOOK_EVENTS = ['connection.update', 'message.received', 'message.status', 'account.restriction'];
+
+const log = logger.child({ module: 'webhook' });
+
+const webhookConfigResolver = createWebhookConfigResolver({
+  query,
+  globalWebhookUrl: config.globalWebhookUrl,
+  globalSecret: config.webhook.secret
+});
+
+export const webhookDispatcher = createWebhookDispatcher({
+  outbox: webhookOutbox,
+  resolveTarget: (sessionId) => webhookConfigResolver.resolve(sessionId),
+  post: createWebhookPoster({ allowPrivate: config.allowPrivateUrls }),
+  maxAttempts: config.webhook.maxAttempts,
+  retryBaseDelayMs: config.webhook.retryBaseDelayMs,
+  retryMaxDelayMs: config.webhook.retryMaxDelayMs,
+  timeoutMs: config.webhook.timeoutMs,
+  retention: { deliveredDays: config.webhook.retentionDays, failedDays: config.webhook.failedRetentionDays },
+  logger: log
+});
 
 /**
- * Drops the cached webhook URL of a session after it was changed.
+ * Drops the cached webhook settings of a session after they changed.
  */
-export function invalidateWebhookUrl(sessionId) {
-  webhookUrlResolver.invalidate(sessionId);
+export function invalidateWebhookConfig(sessionId) {
+  webhookConfigResolver.invalidate(sessionId);
 }
 
 /**
@@ -173,77 +194,21 @@ export function extractMessageData(msg) {
 }
 
 /**
- * Dispatches webhook event to the session's webhook URL (or the global one). Never throws.
+ * Stores a webhook event in the outbox; the dispatcher delivers it with retries. Never throws.
  */
 export async function sendWebhookEvent(sessionId, eventType, payload) {
-  let targetUrl;
   try {
-    targetUrl = await webhookUrlResolver.resolve(sessionId);
-  } catch (err) {
-    console.error(`[Webhook] Failed to resolve webhook URL for ${sessionId}:`, err.message);
-    targetUrl = config.globalWebhookUrl || null;
-  }
-
-  if (!targetUrl) {
-    return; // No webhook configured
-  }
-
-  const body = {
-    event: eventType,
-    sessionId,
-    timestamp: new Date().toISOString(),
-    data: payload
-  };
-
-  try {
-    assertSafeUrl(targetUrl, { allowPrivate: config.allowPrivateUrls, label: 'Webhook URL' });
-    const response = await axios.post(targetUrl, body, {
-      timeout: 10000,
-      maxRedirects: 0,
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'WhatsApp-Gateway-Webhook/1.0'
-      },
-      ...safeRequestOptions({ allowPrivate: config.allowPrivateUrls })
-    });
-
-    await query(
-      `INSERT INTO webhook_logs (session_id, message_id, event_type, webhook_url, payload, status_code, response_body)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        sessionId,
-        payload?.messageId || null,
-        eventType,
-        targetUrl,
-        JSON.stringify(body),
-        response.status,
-        typeof response.data === 'object' ? JSON.stringify(response.data).slice(0, 1000) : String(response.data).slice(0, 1000)
-      ]
-    );
-  } catch (error) {
-    const statusCode = error.response ? error.response.status : null;
-    const responseBody = error.response ? JSON.stringify(error.response.data).slice(0, 1000) : null;
-    const errorMessage = error.message;
-
-    console.warn(`[Webhook] Failed to deliver webhook to ${targetUrl}:`, errorMessage);
-
-    try {
-      await query(
-        `INSERT INTO webhook_logs (session_id, message_id, event_type, webhook_url, payload, status_code, response_body, error_message)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [
-          sessionId,
-          payload?.messageId || null,
-          eventType,
-          targetUrl,
-          JSON.stringify(body),
-          statusCode,
-          responseBody,
-          errorMessage
-        ]
-      );
-    } catch (logErr) {
-      console.error('[Webhook] Failed to log webhook error:', logErr.message);
+    const target = await webhookConfigResolver.resolve(sessionId);
+    if (!target.url || (target.events && !target.events.includes(eventType))) {
+      return;
     }
+    await webhookOutbox.enqueue({
+      sessionId,
+      eventType,
+      payload: { event: eventType, sessionId, timestamp: new Date().toISOString(), data: payload }
+    });
+    webhookDispatcher.wake();
+  } catch (error) {
+    log.error({ sessionId, event: eventType, err: error }, 'Failed to queue webhook event');
   }
 }

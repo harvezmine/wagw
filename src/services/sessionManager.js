@@ -8,7 +8,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import { query } from '../database/db.js';
 import { clearAuthState, usePostgresAuthState } from '../database/postgresAuthState.js';
-import { extractMessageData, invalidateWebhookUrl, sendWebhookEvent } from './webhookService.js';
+import { WEBHOOK_EVENTS, extractMessageData, invalidateWebhookConfig, sendWebhookEvent } from './webhookService.js';
 import { backoffDelay, decideReconnect } from './reconnectPolicy.js';
 import { config } from '../config/index.js';
 import { AppError } from '../utils/errors.js';
@@ -363,7 +363,7 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
     [sessionId, customName || null, webhookUrl || null]
   );
   if (webhookUrl) {
-    invalidateWebhookUrl(sessionId);
+    invalidateWebhookConfig(sessionId);
   }
 
   const { state, saveCreds } = await usePostgresAuthState(sessionId);
@@ -630,6 +630,8 @@ export async function getSessionStatus(sessionId) {
     qrCode: memorySession ? memorySession.qrCode : row.qr_code,
     pairingCode: memorySession ? memorySession.pairingCode : null,
     webhookUrl: row.webhook_url,
+    webhookSecretSet: Boolean(row.webhook_secret),
+    webhookEvents: row.webhook_events,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -653,19 +655,46 @@ export async function getAllSessions() {
 }
 
 /**
- * Updates (or clears, with an empty value) the webhook URL of a session. Takes effect immediately.
+ * Updates the webhook settings of a session. Absent fields stay unchanged; null or "" clears a value.
  */
-export async function setSessionWebhookUrl(sessionId, webhookUrl) {
-  const url = webhookUrl ? String(webhookUrl).trim() : null;
-  if (url) {
-    assertSafeUrl(url, { allowPrivate: config.allowPrivateUrls, label: 'webhookUrl' });
+export async function setSessionWebhookConfig(sessionId, { webhookUrl, webhookSecret, events }) {
+  const assignments = [];
+  const params = [sessionId];
+  const assign = (column, value) => {
+    params.push(value);
+    assignments.push(`${column} = $${params.length}`);
+  };
+
+  if (webhookUrl !== undefined) {
+    const url = webhookUrl ? String(webhookUrl).trim() : null;
+    if (url) assertSafeUrl(url, { allowPrivate: config.allowPrivateUrls, label: 'webhookUrl' });
+    assign('webhook_url', url);
   }
-  const res = await query(`UPDATE sessions SET webhook_url = $1, updated_at = NOW() WHERE id = $2`, [url, sessionId]);
+  if (webhookSecret !== undefined) {
+    const secret = webhookSecret ? String(webhookSecret) : null;
+    if (secret && secret.length < 16) {
+      throw new AppError(400, 'webhookSecret must be at least 16 characters long.');
+    }
+    assign('webhook_secret', secret);
+  }
+  if (events !== undefined) {
+    if (events !== null && (!Array.isArray(events) || events.some((event) => !WEBHOOK_EVENTS.includes(event)))) {
+      throw new AppError(400, `events must be null (all events) or an array of: ${WEBHOOK_EVENTS.join(', ')}.`);
+    }
+    assign('webhook_events', events);
+  }
+
+  const res = await query(
+    `UPDATE sessions SET ${[...assignments, 'updated_at = NOW()'].join(', ')} WHERE id = $1
+     RETURNING webhook_url, webhook_secret IS NOT NULL AS webhook_secret_set, webhook_events`,
+    params
+  );
   if (res.rowCount === 0) {
     throw new AppError(404, `Session "${sessionId}" not found.`);
   }
-  invalidateWebhookUrl(sessionId);
-  return url;
+  invalidateWebhookConfig(sessionId);
+  const row = res.rows[0];
+  return { webhookUrl: row.webhook_url, webhookSecretSet: row.webhook_secret_set, events: row.webhook_events };
 }
 
 /**
@@ -701,7 +730,7 @@ export function logoutSession(sessionId) {
 export async function deleteSession(sessionId) {
   await logoutSession(sessionId);
   await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
-  invalidateWebhookUrl(sessionId);
+  invalidateWebhookConfig(sessionId);
   return { success: true, message: `Session ${sessionId} deleted.` };
 }
 
