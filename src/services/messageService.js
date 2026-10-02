@@ -78,8 +78,8 @@ function prepareMedia(input, label) {
 }
 
 /**
- * Validates and queues an outgoing message. With `wait`, resolves once it was sent or failed,
- * or after SEND_WAIT_TIMEOUT_MS while it is still queued.
+ * Validates and queues an outgoing message. With `wait` (and a connected session), resolves once it
+ * was sent or failed, or after SEND_WAIT_TIMEOUT_MS while it is still queued.
  */
 export async function submitMessage({
   sessionId,
@@ -128,7 +128,9 @@ export async function submitMessage({
     return { item, result: null, duplicate: true };
   }
 
-  const pending = wait && !scheduleAt ? queueRunner.waitFor(item.id, config.queue.sendWaitTimeoutMs) : null;
+  // Waiting only makes sense when the message can go out now
+  const sendable = !scheduleAt && isSessionConnected(sessionId);
+  const pending = wait && sendable ? queueRunner.waitFor(item.id, config.queue.sendWaitTimeoutMs) : null;
   queueRunner.wake();
   return { item, result: pending ? await pending : null, duplicate: false };
 }

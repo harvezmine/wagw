@@ -1465,7 +1465,9 @@ export async function submitMessage({
     return { item, result: null, duplicate: true };
   }
 
-  const pending = wait && !scheduleAt ? queueRunner.waitFor(item.id, config.queue.sendWaitTimeoutMs) : null;
+  // Waiting only makes sense when the message can go out now
+  const sendable = !scheduleAt && isSessionConnected(sessionId);
+  const pending = wait && sendable ? queueRunner.waitFor(item.id, config.queue.sendWaitTimeoutMs) : null;
   queueRunner.wake();
   return { item, result: pending ? await pending : null, duplicate: false };
 }
