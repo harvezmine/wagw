@@ -6,7 +6,7 @@ import { createWebhookConfigResolver } from './webhookConfigResolver.js';
 import { webhookOutbox } from './webhookOutbox.js';
 import { createWebhookDispatcher, createWebhookPoster } from './webhookDispatcher.js';
 
-export const WEBHOOK_EVENTS = ['connection.update', 'message.received', 'message.status', 'account.restriction'];
+export const WEBHOOK_EVENTS = ['connection.update', 'message.received', 'message.status', 'account.restriction', 'call.received'];
 
 const log = logger.child({ module: 'webhook' });
 

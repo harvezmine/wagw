@@ -12,7 +12,11 @@ import {
   listWebhookDeliveries,
   retryWebhookDelivery,
   getLimits,
-  validateSessionNumbers
+  validateSessionNumbers,
+  getGroups,
+  getGroupDetail,
+  getSettings,
+  updateSettings
 } from '../controllers/sessionController.js';
 import { apiKeyAuth, qrPageAuth } from '../middlewares/auth.js';
 import { validateSessionIdParam } from '../utils/validation.js';
@@ -31,6 +35,10 @@ router.get('/', listSessions);
 router.get('/:sessionId/status', getStatus);
 router.get('/:sessionId/limits', getLimits);
 router.post('/:sessionId/validate', validateSessionNumbers);
+router.get('/:sessionId/groups', getGroups);
+router.get('/:sessionId/groups/:groupId', getGroupDetail);
+router.get('/:sessionId/settings', getSettings);
+router.patch('/:sessionId/settings', updateSettings);
 router.post('/:sessionId/qr-link', createQrLink);
 router.post('/:sessionId/pairing-code', requestPairingCode);
 router.put('/:sessionId/webhook', updateWebhook);

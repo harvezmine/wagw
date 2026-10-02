@@ -22,6 +22,7 @@ import { logger } from '../utils/logger.js';
 import { outboundQueue } from './outboundQueue.js';
 import { ackToStatus, allowedPreviousStatuses, describeAckError } from './messageStatus.js';
 import { MEDIA_TYPES, buildMessageContent, historyText, presenceFor } from './messageContent.js';
+import { normalizeSettings } from './sessionSettings.js';
 
 // Map of active in-memory sessions (at most one socket per session)
 const activeSessions = new Map();
@@ -241,6 +242,7 @@ async function handleIncomingMessage(sessionData, msg) {
 
   // Chats may be addressed by LID (Baileys v7); the phone-number JID is kept alongside
   const { remoteJid, remoteJidAlt, senderJid, senderJidAlt, senderPhone, isGroup } = describeMessageAddress(msg.key);
+  if (isGroup && sessionData.settings.ignoreGroups) return;
   const fromMe = Boolean(msg.key.fromMe);
   const messageId = msg.key.id;
   const pushName = msg.pushName || '';
@@ -249,7 +251,7 @@ async function handleIncomingMessage(sessionData, msg) {
   const parsed = extractMessageData(msg);
 
   // Auto mark as read if configured and not from me
-  if (!fromMe && config.antiBan.autoReadMessages) {
+  if (!fromMe && (sessionData.settings.readMessages ?? config.antiBan.autoReadMessages)) {
     try {
       await sock.readMessages([msg.key]);
     } catch (_) {}
@@ -358,7 +360,7 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   }
 
   // Initialize DB record for session (NULL keeps the stored name/webhook)
-  await query(
+  const sessionRow = await query(
     `INSERT INTO sessions (id, custom_name, webhook_url, status, disconnect_reason, updated_at)
      VALUES ($1, $2, $3, 'connecting', NULL, NOW())
      ON CONFLICT (id) DO UPDATE
@@ -366,7 +368,8 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
          webhook_url = COALESCE(EXCLUDED.webhook_url, sessions.webhook_url),
          status = 'connecting',
          disconnect_reason = NULL,
-         updated_at = NOW()`,
+         updated_at = NOW()
+     RETURNING settings`,
     [sessionId, customName || null, webhookUrl || null]
   );
   if (webhookUrl) {
@@ -408,6 +411,7 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   const sessionData = {
     sessionId,
     sock,
+    settings: normalizeSettings(sessionRow.rows[0]?.settings),
     status: 'connecting',
     qrCode: null,
     qrRaw: null,
@@ -491,6 +495,31 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   });
   on('group-participants.update', async ({ id }) => {
     groupCache.del(id);
+  });
+
+  // Incoming calls: report them, and optionally reject and answer with a message
+  on('call', async (calls) => {
+    for (const call of calls) {
+      if (call.status !== 'offer') continue;
+      sendWebhookEvent(sessionId, 'call.received', {
+        callId: call.id,
+        from: call.from,
+        callerPhone: call.callerPn ? phoneFromJid(call.callerPn) : null,
+        isVideo: Boolean(call.isVideo),
+        isGroup: Boolean(call.isGroup)
+      });
+      const { rejectCalls, rejectCallMessage } = sessionData.settings;
+      if (!rejectCalls) continue;
+      await sock.rejectCall(call.id, call.from);
+      if (rejectCallMessage) {
+        await outboundQueue.enqueue({
+          sessionId,
+          targetJid: call.from,
+          messageType: 'text',
+          payload: { text: rejectCallMessage }
+        });
+      }
+    }
   });
 
   return describeSession(sessionData, 'Session initialization triggered.');
@@ -622,6 +651,91 @@ export function shutdownSessions() {
   activeSessions.clear();
 }
 
+// Group list per session: fetching every group is a heavy call, so it is cached and refreshed sparingly
+const groupLists = new Map();
+
+function summarizeGroup(metadata) {
+  return {
+    id: metadata.id,
+    subject: metadata.subject || '',
+    size: metadata.size ?? metadata.participants?.length ?? 0,
+    owner: metadata.owner ?? null,
+    createdAt: metadata.creation ? new Date(metadata.creation * 1000).toISOString() : null,
+    announce: Boolean(metadata.announce),
+    restrict: Boolean(metadata.restrict)
+  };
+}
+
+/**
+ * Groups the account belongs to, from cache (GROUPS_CACHE_MINUTES). `refresh` refetches at most once
+ * per minute. A cached list is served even while the session is offline.
+ */
+export async function listGroups(sessionId, { refresh = false } = {}) {
+  const cached = groupLists.get(sessionId);
+  const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+  const usable = age < config.groups.cacheTtlMs && !(refresh && age >= config.groups.refreshMinIntervalMs);
+  if (cached && (usable || !isSessionConnected(sessionId))) {
+    return { groups: cached.groups, fetchedAt: new Date(cached.fetchedAt).toISOString() };
+  }
+
+  const sock = getConnectedSocket(sessionId);
+  const all = await sock.groupFetchAllParticipating();
+  const metadataCache = getSessionCache(groupMetadataCaches, sessionId, 5 * 60 * 1000);
+  const groups = Object.values(all)
+    .map((metadata) => {
+      metadataCache.set(metadata.id, metadata);
+      return summarizeGroup(metadata);
+    })
+    .sort((a, b) => a.subject.localeCompare(b.subject));
+  const fetchedAt = Date.now();
+  groupLists.set(sessionId, { fetchedAt, groups });
+  return { groups, fetchedAt: new Date(fetchedAt).toISOString() };
+}
+
+export async function getGroup(sessionId, groupJid) {
+  if (!/^\d+(-\d+)?@g\.us$/.test(groupJid)) {
+    throw new AppError(400, 'groupId must be a group JID such as 120363012345678901@g.us.');
+  }
+  const sock = getConnectedSocket(sessionId);
+  const metadataCache = getSessionCache(groupMetadataCaches, sessionId, 5 * 60 * 1000);
+  let metadata = metadataCache.get(groupJid);
+  if (!metadata) {
+    try {
+      metadata = await sock.groupMetadata(groupJid);
+    } catch (error) {
+      throw new AppError(404, `Group "${groupJid}" not found or the account is not a member (${error.message}).`);
+    }
+    metadataCache.set(groupJid, metadata);
+  }
+  return {
+    ...summarizeGroup(metadata),
+    description: metadata.desc ?? null,
+    participants: (metadata.participants || []).map((participant) => ({
+      id: participant.id,
+      phoneNumber: participant.phoneNumber ?? null,
+      admin: participant.admin ?? null
+    }))
+  };
+}
+
+export async function getSessionSettings(sessionId) {
+  const res = await query('SELECT settings FROM sessions WHERE id = $1', [sessionId]);
+  if (!res.rowCount) throw new AppError(404, `Session "${sessionId}" not found.`);
+  return normalizeSettings(res.rows[0].settings);
+}
+
+export async function updateSessionSettings(sessionId, update) {
+  const res = await query(
+    `UPDATE sessions SET settings = settings || $2::jsonb, updated_at = NOW() WHERE id = $1 RETURNING settings`,
+    [sessionId, JSON.stringify(update)]
+  );
+  if (!res.rowCount) throw new AppError(404, `Session "${sessionId}" not found.`);
+  const settings = normalizeSettings(res.rows[0].settings);
+  const session = activeSessions.get(sessionId);
+  if (session) session.settings = settings;
+  return settings;
+}
+
 /**
  * Current WhatsApp restrictions of the account (Baileys v7): new-chat message cap and reach-out timelock.
  */
@@ -750,6 +864,7 @@ export function logoutSession(sessionId) {
     await clearAuthState(sessionId);
     msgRetryCaches.delete(sessionId);
     groupMetadataCaches.delete(sessionId);
+    groupLists.delete(sessionId);
     await query(
       `UPDATE sessions SET status = 'disconnected', disconnect_reason = 'logged_out', qr_code = NULL, phone_number = NULL, updated_at = NOW() WHERE id = $1`,
       [sessionId]

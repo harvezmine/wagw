@@ -7,15 +7,20 @@ import {
   logoutSession,
   deleteSession as deleteSessionService,
   getSessionLimits,
-  setSessionWebhookConfig
+  setSessionWebhookConfig,
+  listGroups,
+  getGroup,
+  getSessionSettings,
+  updateSessionSettings
 } from '../services/sessionManager.js';
+import { parseSettingsUpdate } from '../services/sessionSettings.js';
 import { webhookOutbox } from '../services/webhookOutbox.js';
 import { validateNumbers } from '../services/numberService.js';
 import { webhookDispatcher } from '../services/webhookService.js';
 import { createQrLinkToken } from '../middlewares/auth.js';
 import { config } from '../config/index.js';
 import { AppError, sendError } from '../utils/errors.js';
-import { assertSessionId, parseOptionalInt } from '../utils/validation.js';
+import { assertSessionId, parseOptionalBool, parseOptionalInt } from '../utils/validation.js';
 import { renderConnectedPage, renderInitializingPage, renderMessagePage, renderQrPage } from '../views/sessionPages.js';
 
 /**
@@ -247,6 +252,43 @@ export async function validateSessionNumbers(req, res) {
       countryCode: countryCode === undefined || countryCode === '' ? undefined : String(countryCode)
     });
     return res.status(200).json({ success: true, ...result });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function getGroups(req, res) {
+  try {
+    const refresh = parseOptionalBool(req.query.refresh, { name: 'refresh', defaultValue: false });
+    const { groups, fetchedAt } = await listGroups(req.params.sessionId, { refresh });
+    return res.status(200).json({ success: true, count: groups.length, fetchedAt, groups });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function getGroupDetail(req, res) {
+  try {
+    const group = await getGroup(req.params.sessionId, req.params.groupId);
+    return res.status(200).json({ success: true, group });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function getSettings(req, res) {
+  try {
+    const settings = await getSessionSettings(req.params.sessionId);
+    return res.status(200).json({ success: true, settings });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function updateSettings(req, res) {
+  try {
+    const settings = await updateSessionSettings(req.params.sessionId, parseSettingsUpdate(req.body));
+    return res.status(200).json({ success: true, settings });
   } catch (error) {
     return sendError(res, error, 'SessionController');
   }
