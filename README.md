@@ -18,17 +18,20 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) de
    - Dikirim lewat outbox: retry otomatis dengan backoff, tanda tangan HMAC-SHA256, riwayat delivery bisa dilihat dan di-retry lewat API.
 4. **🛡️ Anti-Ban Humanizer Simulation**:
    - Sebelum pesan dikirim, sistem otomatis mengirim status presence `composing` (mengetik) atau `recording` (merekam audio) dengan jeda waktu natural dinamis berbasis panjang teks.
-5. **Kirim Pesan WhatsApp Lengkap**:
-   - Kirim WhatsApp Pairing Code
-   - Kirim Text Message
-   - Kirim Image (URL / Base64 / File Upload multipart)
-   - Kirim Document / Attachment PDF/ZIP/dll (URL / File Upload multipart)
-6. **Antrian Kirim & Status Pesan**:
+5. **Kirim Pesan WhatsApp Lengkap** (satu endpoint `POST /api/messages/send`):
+   - Text, image, video, audio, voice note, document, sticker, lokasi, kontak (vCard), poll.
+   - Reply (quote), mention, reaksi, edit, dan hapus pesan.
+   - Kirim massal multi-target dengan variabel `{name}`, `{var1}`… (sintaks Fonnte).
+6. **Validasi Nomor & Grup**: cek nomor terdaftar di WhatsApp (dengan cache + throttle), daftar grup dan detail anggota.
+7. **API Key Multi-Tenant**: kunci per klien yang hanya bisa mengakses sesinya sendiri, opsional dengan IP allowlist.
+8. **Kompatibel Fonnte**: endpoint `/fonnte/send` dkk. dan format webhook Fonnte, jadi klien Fonnte bisa pindah cukup dengan ganti base URL dan token.
+9. **Pengaturan per Session**: baca otomatis, tolak panggilan (dengan pesan balasan), abaikan pesan grup.
+10. **Antrian Kirim & Status Pesan**:
    - Semua pesan keluar masuk antrian per nomor dengan jeda acak antar pesan, bisa dijadwalkan (`scheduleAt`), dibatalkan, dijadwal ulang, dan aman dikirim ulang (`idempotencyKey`).
    - Status `sent` → `delivered` → `read` (atau `failed`) disimpan dan dikirim sebagai webhook `message.status`.
-7. **PostgreSQL Database Storage**:
-   - Tabel `sessions`, `baileys_auth_store`, `messages`, `outbound_messages`, `webhook_deliveries`; skema dikelola migrasi otomatis.
-8. **Docker & Docker Compose**:
+11. **PostgreSQL Database Storage**:
+   - Tabel `sessions`, `baileys_auth_store`, `messages`, `outbound_messages`, `webhook_deliveries`, `api_keys`, `number_checks`; skema dikelola migrasi otomatis.
+12. **Docker & Docker Compose**:
    - Siap dideploy dengan satu perintah `docker compose up -d` (Node 22, user non-root, graceful shutdown).
 
 ---
@@ -50,8 +53,13 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) de
 │   │   ├── migrate.js       # Runner migrasi SQL (otomatis saat start)
 │   │   ├── migrations/      # 001_initial.sql, 002_..., 003_...
 │   │   └── postgresAuthState.js # Baileys Auth Store adapter ke PostgreSQL
+│   ├── fonnte/              # Adapter kompatibel Fonnte (parameter, route, format webhook)
 │   ├── services/
 │   │   ├── sessionManager.js # Core Multi-device, Baileys socket, anti-ban presence
+│   │   ├── messageContent.js / bulkTargets.js # Validasi & konten per tipe pesan, target massal + template
+│   │   ├── apiKeys.js       # API key tenant (hash, cache, IP allowlist)
+│   │   ├── numberCheck.js / numberService.js # Validasi nomor (cache + throttle)
+│   │   ├── sessionSettings.js # Pengaturan per session
 │   │   ├── reconnectPolicy.js # Keputusan reconnect/stop per kode disconnect
 │   │   ├── messageService.js # Submit pesan ke antrian + queue runner
 │   │   ├── outboundQueue.js / queueRunner.js # Antrian kirim (Postgres) & worker per session
@@ -62,7 +70,8 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) de
 │   ├── controllers/
 │   │   ├── sessionController.js # Handler API session & QR
 │   │   ├── messageController.js # Handler API kirim pesan & riwayat
-│   │   └── queueController.js   # Handler API antrian
+│   │   ├── queueController.js   # Handler API antrian
+│   │   └── keysController.js    # Handler API key tenant
 │   ├── middlewares/
 │   │   └── auth.js          # API key (header) & signed QR link
 │   ├── utils/               # Validasi, normalisasi nomor, guard SSRF, cache, lock
@@ -72,7 +81,8 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) de
 │       ├── index.js
 │       ├── sessionRoutes.js
 │       ├── messageRoutes.js
-│       └── queueRoutes.js
+│       ├── queueRoutes.js
+│       └── keysRoutes.js
 └── test/                    # Unit & integration test (node --test)
 ```
 
@@ -129,7 +139,7 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` (v7) de
 
 ## 🔐 Autentikasi
 
-- Semua endpoint (kecuali `/api/health`) membutuhkan header **`x-api-key: <API_KEY>`**. API key lewat query string (`?apiKey=`) **tidak lagi diterima** karena bocor ke log dan riwayat browser.
+- Semua endpoint (kecuali `/api/health`) membutuhkan header **`x-api-key`** berisi master `API_KEY` atau **API key tenant** (lihat [API Key Multi-Tenant](#-api-key-multi-tenant)). API key lewat query string (`?apiKey=`) **tidak diterima** karena bocor ke log dan riwayat browser.
 - Dengan `NODE_ENV=production`, server menolak start kalau `API_KEY` kosong atau kurang dari 16 karakter.
 - Halaman QR di browser tidak bisa mengirim header, jadi dipakai **signed link** berumur pendek (default 10 menit, `QR_LINK_TTL_SECONDS`) yang hanya berlaku untuk satu session. Link ini dikembalikan di field `qrPage.url` oleh `POST /api/sessions/init` dan `POST /api/sessions/:sessionId/qr-link`.
 - `sessionId` hanya boleh berisi huruf, angka, `.`, `_`, `-` (maksimal 64 karakter).
@@ -313,6 +323,120 @@ curl "http://localhost:3000/api/messages/device-1/download/ACDCBDA49D620C139EC01
 
 ---
 
+## ✉️ Endpoint Kirim Terpadu
+
+`POST /api/messages/send` (JSON, atau `multipart/form-data` dengan field `file` untuk upload media). Semua pesan lewat antrian, jadi opsi `async`, `scheduleAt`, `idempotencyKey`, `connectOnly`, `delayMs`, dan `countryCode` di bagian [Antrian Kirim](#-antrian-kirim--status-pesan) berlaku di sini.
+
+| `type` | Field | Contoh body |
+|---|---|---|
+| `text` (default) | `text` | `{"sessionId":"s1","to":"0812...","text":"Halo"}` |
+| `image`, `video`, `document`, `audio`, `voice`, `sticker` | `media.url` / `media.base64` / upload `file`, `caption`, `media.fileName`, `media.mimetype`, `gifPlayback` (video) | `{"type":"document","to":"0812...","media":{"url":"https://.../inv.pdf","fileName":"INV.pdf"},"caption":"Invoice"}` |
+| `location` | `location.latitude`, `location.longitude`, `location.name`, `location.address` | `{"type":"location","to":"0812...","location":{"latitude":-6.17,"longitude":106.82,"name":"Monas"}}` |
+| `contact` | `contact` atau `contacts` (maks 20) berisi `{name, phone}` | `{"type":"contact","to":"0812...","contact":{"name":"CS","phone":"0811..."}}` |
+| `poll` | `poll.name`, `poll.options` (2–12, unik), `poll.selectableCount` (0 = bebas pilih banyak) | `{"type":"poll","to":"0812...","poll":{"name":"Menu?","options":["Bakso","Soto"]}}` |
+| `reaction` | `messageId`, `emoji` (kosong = hapus reaksi) | `{"type":"reaction","messageId":"3EB0...","emoji":"👍"}` |
+| `edit` | `messageId`, `text` (hanya pesan milik session ini) | `{"type":"edit","messageId":"3EB0...","text":"Revisi"}` |
+| `delete` | `messageId` (hapus untuk semua) | `{"type":"delete","messageId":"3EB0..."}` |
+
+- **Opsi tambahan:**
+  - `replyTo`: `messageId` yang dikutip (quote).
+  - `mentions`: daftar nomor yang di-mention. Tulis juga `@628...` di teks supaya tampil.
+- **Pesan acuan:** `reaction`/`edit`/`delete`/`replyTo` mencari pesan di riwayat (`messages`). Untuk tiga tipe pertama, `to` tidak perlu diisi.
+- **Voice note** (`voice`) harus berupa file **OGG/Opus**; gateway tidak melakukan konversi audio.
+
+**Kirim massal**: `to` berisi beberapa target (array, atau dipisah koma) dengan sintaks Fonnte `nomor|nama|var1|var2`:
+```json
+{
+  "sessionId": "s1",
+  "to": "08111111111|Budi|VIP, 08122222222|Ani|Reguler",
+  "text": "Halo {name}, status member Anda: {var1}"
+}
+```
+- **Respons:** selalu `202`, berisi hasil per target (`queued`, `duplicate`, `skipped` untuk duplikat dalam request, `invalid`); target yang salah tidak menggagalkan yang lain.
+- **Batas:** maksimal `BULK_MAX_TARGETS` (500).
+- **Media:** harus berupa `media.url`.
+- **Jeda:** jeda antar pesan per nomor dari antrian tetap berlaku.
+
+> Kirim massal ke nomor yang belum pernah chat adalah penyebab ban paling umum. Pakai hanya untuk penerima yang sudah opt-in, dan cek `GET /api/sessions/:sessionId/limits` sebelum kampanye.
+
+---
+
+## 🔎 Validasi Nomor, Grup & Pengaturan Session
+
+**Validasi nomor** — `POST /api/sessions/:sessionId/validate` body `{"numbers": ["0812...", "0813..."], "countryCode": "62"}`:
+- **Respons:** `{ registered: [...], notRegistered: [...], invalid: [...], results: [...] }`.
+- **Batasan:**
+  - Maksimal `VALIDATE_MAX_NUMBERS` (50) nomor per request.
+  - Hasil di-cache `VALIDATE_CACHE_DAYS` (7 hari).
+  - Lookup ke WhatsApp dijalankan bergantian per session dengan jeda `VALIDATE_MIN_INTERVAL_MS`, karena lookup kontak massal juga sinyal ban.
+
+**Grup**:
+- `GET /api/sessions/:sessionId/groups`:
+  - Daftar grup (id, subject, size, owner, …) dari cache 10 menit.
+  - `?refresh=true` mengambil ulang, paling cepat sekali per menit.
+- `GET /api/sessions/:sessionId/groups/:groupId`: detail grup beserta anggota (`id`, `phoneNumber`, `admin`).
+- Kirim ke grup memakai `to: "1203...@g.us"`.
+
+**Pengaturan session** — `GET` / `PATCH /api/sessions/:sessionId/settings`:
+
+| Setting | Default | Fungsi |
+|---|---|---|
+| `readMessages` | `null` (ikut `AUTO_READ_MESSAGES`) | Kirim tanda baca (centang biru) untuk pesan masuk |
+| `rejectCalls` | `false` | Tolak panggilan masuk otomatis |
+| `rejectCallMessage` | `null` | Pesan yang dikirim (lewat antrian) ke penelepon yang ditolak |
+| `ignoreGroups` | `false` | Abaikan pesan grup (tidak disimpan, tidak di-webhook) |
+
+Panggilan masuk selalu dilaporkan lewat webhook `call.received` (`callId`, `from`, `callerPhone`, `isVideo`, `isGroup`).
+
+---
+
+## 🔑 API Key Multi-Tenant
+
+Master `API_KEY` bisa membuat kunci tenant. Setiap kunci tenant hanya bisa mengakses session yang ditentukan, dan opsional hanya dari IP tertentu:
+```bash
+curl -X POST http://localhost:3000/api/keys \
+  -H "x-api-key: $API_KEY" -H 'content-type: application/json' \
+  -d '{"name":"Klien A","sessionIds":["klien-a"],"ipAllowlist":["203.0.113.0/24"]}'
+# -> {"key":"wagw_3f2a9c1b7e_...","apiKey":{"id":1,...}}  (key hanya ditampilkan sekali)
+```
+- **Pemakaian:** pakai di header `x-api-key`.
+  - `sessionIds: null` = semua session.
+  - `ipAllowlist: null` = semua IP.
+- **Hak akses tenant:**
+  - Hanya melihat session-nya sendiri, termasuk di daftar session dan daftar antrian.
+  - Request ke session lain dibalas `403`.
+  - Tidak bisa mengelola API key.
+- **Manajemen key:** `GET /api/keys` (daftar, tanpa secret) dan `DELETE /api/keys/:keyId` (cabut; langsung berlaku). Keduanya hanya untuk master key.
+- **Keamanan:** kunci disimpan sebagai hash SHA-256.
+- **Di belakang reverse proxy:** set `TRUST_PROXY` (misalnya `1` atau `loopback`) supaya IP allowlist membaca IP klien yang benar.
+
+---
+
+## 🔁 Migrasi dari Fonnte
+
+Gateway menyediakan endpoint dengan parameter dan format respons Fonnte di `/fonnte`. Selalu HTTP 200 dengan `status: true/false` dan `reason`, sama seperti Fonnte.
+
+1. Buat API key tenant yang terikat ke **tepat satu** session (session = "device" Fonnte). Key itu dipakai sebagai token Fonnte.
+2. Ganti base URL `https://api.fonnte.com` menjadi `https://gateway-anda/fonnte`. Header `Authorization: <token>` tetap sama; beberapa token dipisah koma akan dirotasi antar session.
+3. Opsional: `PUT /api/sessions/:sessionId/webhook` dengan `"format": "fonnte"` supaya payload webhook (pesan masuk, status pesan, connect/disconnect) berbentuk seperti Fonnte.
+
+| Endpoint Fonnte | Didukung | Catatan |
+|---|---|---|
+| `POST /send` | ✓ | `target` (`nomor\|nama\|var`, grup), `message`, `url`/`file`, `filename`, `schedule`, `delay` (`"5"`/`"5-10"`), `countryCode`, `location`, `typing`+`duration`, `choices`/`select`/`pollname`, `connectOnly`, `followup`, `data`, `inboxid` (reply). `preview` dan `sequence` diabaikan (antrian sudah berurutan per nomor) |
+| `POST /validate` | ✓ | `registered` / `not_registered` (maks `VALIDATE_MAX_NUMBERS`) |
+| `POST /device` | ✓ | `device`, `device_status`, `name`; kuota selalu `unlimited` |
+| `POST /get-whatsapp-group`, `/fetch-group` | ✓ | Dari cache grup |
+| `POST /delete-message` | ✓ | Membatalkan pesan yang masih `queued` (id = id dari respons `/send`) |
+| GET `/send?token=` | ✗ | Sengaja tidak didukung (token bocor ke log) |
+| Rotator, autoreply, flow, dashboard | ✗ | Di luar gateway ini |
+
+**Webhook format Fonnte:**
+- **Pesan masuk:** `device`, `sender`, `message`, `text`, `member`, `name`, `location`, `pollname`, `choices`, `filename`, `extension`, `inboxid`, `timestamp`. URL file media tidak disertakan; unduh lewat `GET /api/messages/:sessionId/download/:inboxid`.
+- **Status pesan:** `device`, `id`, `stateid`, `status` / `state`.
+- **Koneksi:** `device`, `status` (`connect`/`disconnect`), `reason`, `timestamp`.
+
+---
+
 ## 📬 Antrian Kirim & Status Pesan
 
 Semua endpoint kirim (`send-text`, `send-image`, `send-attachment`) memasukkan pesan ke tabel `outbound_messages`. Worker mengirim **satu pesan per nomor pada satu waktu** dengan jeda acak `SEND_INTERVAL_MIN_MS`–`SEND_INTERVAL_MAX_MS` (default 2–6 detik) antar pesan; nomor yang berbeda diproses paralel. Pesan pertama pada nomor yang sedang diam langsung terkirim.
@@ -422,7 +546,7 @@ Event `message.status` (dari antrian dan tanda terima WhatsApp):
 ```
 `status`: `sent`, `delivered`, `read`, `played`, `failed`, `expired`. Untuk `failed` karena penolakan WhatsApp, `error` menjelaskan kodenya, misalnya `WhatsApp error 463: account restricted from starting new chats (...)`.
 
-Event lain: `account.restriction` (data = status reach-out timelock dari WhatsApp).
+Event lain: `account.restriction` (data = status reach-out timelock dari WhatsApp) dan `call.received` (panggilan masuk).
 
 ### Pengiriman, retry & keamanan webhook
 
@@ -464,7 +588,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   "events": ["message.received", "message.status"]
 }
 ```
-`events: null` = semua event (`connection.update`, `message.received`, `message.status`, `account.restriction`). Perubahan berlaku maksimal 30 detik kemudian, tanpa restart session.
+`events: null` = semua event (`connection.update`, `message.received`, `message.status`, `account.restriction`, `call.received`). Field `format`: `"default"` atau `"fonnte"` (lihat [Migrasi dari Fonnte](#-migrasi-dari-fonnte)). Perubahan berlaku maksimal 30 detik kemudian, tanpa restart session.
 
 **Riwayat delivery**:
 - `GET /api/sessions/:sessionId/webhook-deliveries?status=failed`: status, percobaan, kode HTTP, dan error terakhir.
@@ -504,6 +628,10 @@ Lihat `.env.example` untuk daftar lengkap.
 | `LOG_PRETTY` | `true` kecuali production | Log mudah dibaca; di production log berupa JSON per baris. |
 | `BAILEYS_LOG_LEVEL` | `error` | Level log internal Baileys. |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | Batas waktu graceful shutdown sebelum dipaksa keluar. |
+| `TRUST_PROXY` | – | Setting Express `trust proxy` (`1`, `true`, `loopback`, …) agar IP klien benar di belakang reverse proxy. |
+| `BULK_MAX_TARGETS` | `500` | Maksimal target per request kirim massal. |
+| `VALIDATE_MAX_NUMBERS` / `VALIDATE_MIN_INTERVAL_MS` / `VALIDATE_CACHE_DAYS` | `50` / `3000` / `7` | Batas, throttle, dan cache validasi nomor. |
+| `GROUPS_CACHE_MINUTES` | `10` | Umur cache daftar grup. |
 
 Port PostgreSQL di `docker-compose.yml` hanya di-bind ke `127.0.0.1`.
 

@@ -247,6 +247,44 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="card">
+          <h2>✉️ Unified Send, Contacts &amp; Groups</h2>
+          <div class="endpoint">
+            <span class="badge-method badge-post">POST</span>
+            <span class="path">/api/messages/send</span>
+            <div class="desc">Every message type (text, image, video, audio, voice, document, sticker, location, contact, poll, reaction, edit, delete) with <code>replyTo</code>/<code>mentions</code>; several targets with <code>{name}</code>/<code>{var1}</code> templating</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-post">POST</span>
+            <span class="path">/api/sessions/:sessionId/validate</span>
+            <div class="desc">Check which numbers are on WhatsApp (cached, throttled)</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-get">GET</span>
+            <span class="path">/api/sessions/:sessionId/groups</span>
+            <div class="desc">Groups of the account (cached); /groups/:groupId for participants</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-put">PATCH</span>
+            <span class="path">/api/sessions/:sessionId/settings</span>
+            <div class="desc">readMessages, rejectCalls, rejectCallMessage, ignoreGroups</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>🔑 Tenants &amp; Fonnte</h2>
+          <div class="endpoint">
+            <span class="badge-method badge-post">POST</span>
+            <span class="path">/api/keys</span>
+            <div class="desc">Master key only: create a tenant key limited to <code>sessionIds</code> and an optional <code>ipAllowlist</code>; GET to list, DELETE /api/keys/:keyId to revoke</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-post">POST</span>
+            <span class="path">/fonnte/send</span>
+            <div class="desc">Fonnte-compatible API (send, validate, device, get-whatsapp-group, fetch-group, delete-message) with a tenant key as device token</div>
+          </div>
+        </div>
+
+        <div class="card">
           <h2>💬 Message Endpoints</h2>
           <div class="endpoint">
             <span class="badge-method badge-post">POST</span>
