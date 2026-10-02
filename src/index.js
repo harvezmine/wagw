@@ -2,15 +2,26 @@ import express from 'express';
 import cors from 'cors';
 import { config, validateConfig } from './config/index.js';
 import { initDatabase, pool } from './database/db.js';
-import { restoreSessions, shutdownSessions } from './services/sessionManager.js';
+import { getConnectedSessionSockets, restoreSessions, shutdownSessions } from './services/sessionManager.js';
 import apiRoutes from './routes/index.js';
 import fonnteRoutes from './fonnte/fonnteRoutes.js';
 import { logger } from './utils/logger.js';
 import { outboundQueue } from './services/outboundQueue.js';
 import { queueRunner } from './services/messageService.js';
 import { webhookDispatcher } from './services/webhookService.js';
+import { antiBan, createHealthMonitor } from './services/antiBan.js';
+import { guardStore } from './services/guardStore.js';
 
 const app = express();
+
+// Pauses campaigns of sessions whose delivery or reply rates drop; refreshes WhatsApp's new-chat quota
+const healthMonitor = createHealthMonitor({
+  getConnectedSessions: getConnectedSessionSockets,
+  store: guardStore,
+  antiBan,
+  rules: config.guard,
+  logger: logger.child({ module: 'health' })
+});
 let server = null;
 
 // Needed behind a reverse proxy so req.ip (used by API key IP allowlists) is the client address
@@ -355,6 +366,7 @@ async function startServer() {
     await restoreSessions();
     queueRunner.start();
     webhookDispatcher.start();
+    healthMonitor.start();
 
     server = app.listen(config.port, config.host, () => {
       logger.info({ url: `http://${config.host}:${config.port}`, docs: `http://localhost:${config.port}/` }, 'WhatsApp Web Gateway is running');
@@ -383,6 +395,7 @@ async function shutdown(signal) {
 
   try {
     server?.close();
+    healthMonitor.stop();
     await queueRunner.stop();
     shutdownSessions();
     await webhookDispatcher.stop();

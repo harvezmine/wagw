@@ -99,6 +99,15 @@ export function createGuardStore(db = defaultDb) {
       return res.rowCount > 0;
     },
 
+    /**
+     * Ends an active pause now. The end time is kept: the health monitor only judges sends after it.
+     */
+    async endPause(sessionId, scope) {
+      const [untilColumn] = pauseColumns(scope);
+      const res = await db.query(`UPDATE sessions SET ${untilColumn} = NOW() WHERE id = $1 AND ${untilColumn} > NOW()`, [sessionId]);
+      return res.rowCount > 0;
+    },
+
     async setChatCap(sessionId, info) {
       const cap = normalizeChatCap(info);
       await db.query('UPDATE sessions SET chat_cap = $2::jsonb WHERE id = $1', [sessionId, JSON.stringify(cap)]);
@@ -208,31 +217,36 @@ export function createGuardStore(db = defaultDb) {
      * Recent outcomes for the health monitor:
      * - delivery: 1:1 messages sent 2-24 hours ago and how many reached the phone;
      * - replies: campaign messages that opened a new chat 1-7 days ago and how many got an answer.
+     * `since` leaves out older sends (e.g. those that caused a pause that has ended since).
      */
-    async healthMetrics(sessionId, now = new Date()) {
+    async healthMetrics(sessionId, now = new Date(), since = null) {
       const res = await db.query(
         `SELECT
            (SELECT COUNT(*)::int FROM outbound_messages o
             WHERE o.session_id = $1 AND o.sent_at BETWEEN $2::timestamptz - INTERVAL '24 hours' AND $2::timestamptz - INTERVAL '2 hours'
               AND (o.target_jid LIKE '%@s.whatsapp.net' OR o.target_jid LIKE '%@lid')
-              AND o.message_type <> ALL($3::text[])) AS delivery_sample,
+              AND o.message_type <> ALL($3::text[])
+              AND ($4::timestamptz IS NULL OR o.sent_at >= $4)) AS delivery_sample,
            (SELECT COUNT(*)::int FROM outbound_messages o
             WHERE o.session_id = $1 AND o.sent_at BETWEEN $2::timestamptz - INTERVAL '24 hours' AND $2::timestamptz - INTERVAL '2 hours'
               AND (o.target_jid LIKE '%@s.whatsapp.net' OR o.target_jid LIKE '%@lid')
               AND o.message_type <> ALL($3::text[])
+              AND ($4::timestamptz IS NULL OR o.sent_at >= $4)
               AND o.status IN ('delivered', 'read', 'played')) AS delivered,
            (SELECT COUNT(*)::int FROM outbound_messages o
             WHERE o.session_id = $1 AND o.new_contact AND o.category = 'campaign'
-              AND o.sent_at BETWEEN $2::timestamptz - INTERVAL '7 days' AND $2::timestamptz - INTERVAL '24 hours') AS reply_sample,
+              AND o.sent_at BETWEEN $2::timestamptz - INTERVAL '7 days' AND $2::timestamptz - INTERVAL '24 hours'
+              AND ($4::timestamptz IS NULL OR o.sent_at >= $4)) AS reply_sample,
            (SELECT COUNT(*)::int FROM outbound_messages o
             WHERE o.session_id = $1 AND o.new_contact AND o.category = 'campaign'
               AND o.sent_at BETWEEN $2::timestamptz - INTERVAL '7 days' AND $2::timestamptz - INTERVAL '24 hours'
+              AND ($4::timestamptz IS NULL OR o.sent_at >= $4)
               AND EXISTS (
                 SELECT 1 FROM messages m
                 WHERE m.session_id = $1 AND m.from_me = false AND m.created_at > o.sent_at
                   AND (m.remote_jid = o.target_jid OR m.remote_jid_alt = o.target_jid)
               )) AS replied`,
-        [sessionId, now, NON_DELIVERABLE_TYPES]
+        [sessionId, now, NON_DELIVERABLE_TYPES, since]
       );
       const row = res.rows[0];
       return { deliverySample: row.delivery_sample, delivered: row.delivered, replySample: row.reply_sample, replied: row.replied };

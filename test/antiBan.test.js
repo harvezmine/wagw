@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createAntiBan } from '../src/services/antiBan.js';
+import { createAntiBan, createHealthMonitor } from '../src/services/antiBan.js';
 
 const NOW = Date.parse('2026-10-03T05:00:00Z');
 const HOUR = 3600000;
@@ -130,4 +130,52 @@ test('bans and consents are stored and reported', async () => {
     'keyword'
   ]);
   assert.deepEqual(events.at(-1), ['contact.consent', { jid: '62811@s.whatsapp.net', jids: ['62811@s.whatsapp.net', '111@lid'], status: 'opted_out', source: 'keyword' }]);
+});
+
+test('the health monitor polls the chat cap sparingly and pauses unhealthy campaigns once', async () => {
+  let clock = NOW;
+  const pauses = [];
+  const caps = [];
+  let campaignsPausedUntil = null;
+  let metricsSince;
+  const monitor = createHealthMonitor({
+    getConnectedSessions: () => [{ sessionId: 's1', sock: { fetchNewChatMessageCap: async () => ({ total_quota: 150, used_quota: 3, capping_status: 'NONE' }) } }],
+    store: {
+      async getGuards() {
+        return { campaignsPausedUntil };
+      },
+      async healthMetrics(sessionId, now, since) {
+        metricsSince = since;
+        return { deliverySample: 40, delivered: 4, replySample: 0, replied: 0 };
+      }
+    },
+    antiBan: {
+      async applyChatCap(sessionId, info) {
+        caps.push(info.used_quota);
+      },
+      async pauseSession(sessionId, scope, until, reason) {
+        pauses.push([scope, until.getTime(), reason]);
+        campaignsPausedUntil = until;
+        return true;
+      }
+    },
+    rules: { capPollMs: 6 * HOUR, healthCheckIntervalMs: 600000, healthMinSample: 20, healthMinDeliveryRate: 0.6, healthMinReplyRate: 0.05, healthPauseMs: 24 * HOUR },
+    now: () => clock
+  });
+
+  await monitor.runOnce();
+  assert.deepEqual(caps, [3]);
+  assert.deepEqual(pauses, [['campaigns', NOW + 24 * HOUR, 'health: low delivery rate (10% of 40 recent messages)']]);
+  assert.equal(metricsSince, null);
+
+  clock += HOUR;
+  await monitor.runOnce();
+  assert.equal(caps.length, 1);
+  assert.equal(pauses.length, 1);
+
+  // After the pause ends only messages sent since then count
+  clock = NOW + 25 * HOUR;
+  await monitor.runOnce();
+  assert.equal(caps.length, 2);
+  assert.equal(metricsSince.getTime(), NOW + 24 * HOUR);
 });

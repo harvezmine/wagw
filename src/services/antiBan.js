@@ -2,6 +2,7 @@ import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { guardStore } from './guardStore.js';
 import { sendWebhookEvent } from './webhookService.js';
+import { evaluateHealth } from './healthPolicy.js';
 
 const RESTRICTION_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const LOOKUP_TIMEOUT_MS = 15000;
@@ -101,6 +102,76 @@ export function createAntiBan({ store, emit, rules, now = Date.now, logger: log 
     async recordConsent(sessionId, jids, status, source) {
       await store.setConsents(sessionId, jids.map((jid) => ({ jid, status })), source);
       emit(sessionId, 'contact.consent', { jid: jids[0], jids, status, source });
+    }
+  };
+}
+
+/**
+ * Periodically, for every connected session:
+ * - refreshes WhatsApp's new-chat quota (at most every `capPollMs`; WhatsApp also pushes changes);
+ * - pauses campaigns for `healthPauseMs` when delivery or reply rates drop (like Meta pausing a
+ *   low-quality template). Sends from before the last campaign pause ended are not judged again.
+ */
+export function createHealthMonitor({ getConnectedSessions, store, antiBan: reactions, rules, now = Date.now, logger: log = null }) {
+  const lastCapPoll = new Map();
+  let timer = null;
+  let running = false;
+
+  async function pollChatCap(sessionId, sock) {
+    const last = lastCapPoll.get(sessionId);
+    if (typeof sock.fetchNewChatMessageCap !== 'function' || (last !== undefined && now() - last < rules.capPollMs)) return;
+    lastCapPoll.set(sessionId, now());
+    try {
+      const info = await withTimeout(sock.fetchNewChatMessageCap(), LOOKUP_TIMEOUT_MS);
+      if (info) await reactions.applyChatCap(sessionId, info);
+    } catch (error) {
+      // WhatsApp answers this query with errors for many accounts; the pushed updates still arrive
+      log?.debug({ sessionId, err: error.message }, 'Could not fetch the new-chat quota');
+    }
+  }
+
+  async function checkSession({ sessionId, sock }) {
+    await pollChatCap(sessionId, sock);
+    const guards = (await store.getGuards(sessionId)) || {};
+    const pausedUntil = guards.campaignsPausedUntil ? new Date(guards.campaignsPausedUntil) : null;
+    if (pausedUntil && pausedUntil.getTime() > now()) return;
+    const metrics = await store.healthMetrics(sessionId, new Date(now()), pausedUntil);
+    const verdict = evaluateHealth(metrics, {
+      minSample: rules.healthMinSample,
+      minDeliveryRate: rules.healthMinDeliveryRate,
+      minReplyRate: rules.healthMinReplyRate
+    });
+    if (verdict.pause) {
+      await reactions.pauseSession(sessionId, 'campaigns', new Date(now() + rules.healthPauseMs), `health: ${verdict.reason}`);
+    }
+  }
+
+  async function runOnce() {
+    if (running) return;
+    running = true;
+    try {
+      for (const session of getConnectedSessions()) {
+        try {
+          await checkSession(session);
+        } catch (error) {
+          log?.error({ sessionId: session.sessionId, err: error }, 'Health check failed');
+        }
+      }
+    } finally {
+      running = false;
+    }
+  }
+
+  return {
+    runOnce,
+    start() {
+      if (timer) return;
+      timer = setInterval(runOnce, rules.healthCheckIntervalMs);
+      timer.unref?.();
+    },
+    stop() {
+      clearInterval(timer);
+      timer = null;
     }
   };
 }

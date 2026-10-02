@@ -180,3 +180,16 @@ test('healthMetrics counts delivery of personal messages and replies to campaign
 
   assert.deepEqual(await store.healthMetrics('s1'), { deliverySample: 3, delivered: 2, replySample: 2, replied: 1 });
 });
+
+test('endPause ends an active pause but keeps when it ended; healthMetrics can start from there', { skip }, async () => {
+  assert.equal(await store.endPause('s1', 'campaigns'), false);
+  await store.pause('s1', 'campaigns', new Date(Date.now() + 3600000), 'health: low reply rate');
+  assert.equal(await store.endPause('s1', 'campaigns'), true);
+  const guards = await store.getGuards('s1');
+  assert.ok(guards.campaignsPausedUntil <= new Date());
+
+  await sent('s1', P1, { status: 'sent', ago: '5 hours' });
+  await sent('s1', P2, { status: 'delivered', ago: '3 hours' });
+  assert.equal((await store.healthMetrics('s1')).deliverySample, 2);
+  assert.equal((await store.healthMetrics('s1', new Date(), hoursAgo(4))).deliverySample, 1);
+});

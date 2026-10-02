@@ -18,6 +18,7 @@ import {
   getSettings,
   updateSettings
 } from '../controllers/sessionController.js';
+import { deleteConsent, getHealth, listConsents, putConsents, resumeHealth } from '../controllers/guardController.js';
 import { authenticate, qrPageAuth, requireSessionAccess } from '../middlewares/auth.js';
 import { validateSessionIdParam } from '../utils/validation.js';
 
@@ -39,6 +40,11 @@ router.get('/:sessionId/groups', requireSessionAccess, getGroups);
 router.get('/:sessionId/groups/:groupId', requireSessionAccess, getGroupDetail);
 router.get('/:sessionId/settings', requireSessionAccess, getSettings);
 router.patch('/:sessionId/settings', requireSessionAccess, updateSettings);
+router.get('/:sessionId/health', requireSessionAccess, getHealth);
+router.post('/:sessionId/health/resume', requireSessionAccess, resumeHealth);
+router.get('/:sessionId/consents', requireSessionAccess, listConsents);
+router.put('/:sessionId/consents', requireSessionAccess, putConsents);
+router.delete('/:sessionId/consents/:number', requireSessionAccess, deleteConsent);
 router.post('/:sessionId/qr-link', requireSessionAccess, createQrLink);
 router.post('/:sessionId/pairing-code', requireSessionAccess, requestPairingCode);
 router.put('/:sessionId/webhook', requireSessionAccess, updateWebhook);
