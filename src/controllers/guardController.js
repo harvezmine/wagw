@@ -90,7 +90,8 @@ export async function listConsents(req, res) {
     const limit = parseOptionalInt(req.query.limit, { name: 'limit', min: 1, max: 1000, defaultValue: 100 });
     const offset = parseOptionalInt(req.query.offset, { name: 'offset', min: 0, max: Number.MAX_SAFE_INTEGER, defaultValue: 0 });
     if (!(await guardStore.getGuards(sessionId))) throw new AppError(404, `Session "${sessionId}" not found.`);
-    const consents = await guardStore.listConsents(sessionId, { status, limit, offset });
+    const rows = await guardStore.listConsents(sessionId, { status, limit, offset });
+    const consents = rows.map((row) => ({ jid: row.jid, status: row.status, source: row.source, updatedAt: row.updated_at }));
     return res.status(200).json({ success: true, count: consents.length, consents });
   } catch (error) {
     return sendError(res, error, 'GuardController');
