@@ -8,6 +8,30 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/**
+ * Query helpers bound to a pool. `withTransaction` runs `fn(client)` inside BEGIN/COMMIT and
+ * rolls back (and rethrows) on any error.
+ */
+export function createDb(pool) {
+  return {
+    query: (text, params) => pool.query(text, params),
+    async withTransaction(fn) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await fn(client);
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+  };
+}
+
 export const pool = new Pool({
   host: config.db.host,
   port: config.db.port,
@@ -24,27 +48,24 @@ pool.on('error', (err) => {
   console.error('[PostgreSQL] Unexpected error on idle client:', err);
 });
 
-export async function query(text, params) {
-  const start = Date.now();
-  const res = await pool.query(text, params);
-  const duration = Date.now() - start;
-  // console.log('[DB Query]', { text, duration, rows: res.rowCount });
-  return res;
-}
+export const db = createDb(pool);
+export const query = db.query;
+export const withTransaction = db.withTransaction;
 
 export async function initDatabase() {
   try {
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schemaSql = fs.readFileSync(schemaPath, 'utf8');
     await pool.query(schemaSql);
-    
+
     // Auto-migration for existing tables
     await pool.query(`
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_jid VARCHAR(150);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS push_name VARCHAR(150);
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS disconnect_reason VARCHAR(100);
     `);
-    
+
     console.log('[PostgreSQL] Database tables initialized and verified successfully.');
   } catch (error) {
     console.error('[PostgreSQL] Failed to initialize database tables:', error.message);

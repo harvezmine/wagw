@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { config } from './config/index.js';
+import { config, validateConfig } from './config/index.js';
 import { initDatabase } from './database/db.js';
 import { restoreSessions } from './services/sessionManager.js';
 import apiRoutes from './routes/index.js';
@@ -15,7 +15,9 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    console.log(`[HTTP] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
+    // Path only: query strings may carry signed QR link tokens
+    const path = req.originalUrl.split('?')[0];
+    console.log(`[HTTP] ${req.method} ${path} -> ${res.statusCode} (${Date.now() - start}ms)`);
   });
   next();
 });
@@ -156,17 +158,22 @@ app.get('/', (req, res) => {
           <div class="endpoint">
             <span class="badge-method badge-get">GET</span>
             <span class="path">/api/sessions/:sessionId/qr?format=html</span>
-            <div class="desc">Get QR Code for scanning (format: json, html, or image)</div>
+            <div class="desc">Get QR Code for scanning (format: json, html, or image). Browsers open the signed <code>qrPage.url</code> returned by init or qr-link.</div>
+          </div>
+          <div class="endpoint">
+            <span class="badge-method badge-post">POST</span>
+            <span class="path">/api/sessions/:sessionId/qr-link</span>
+            <div class="desc">Create a short-lived signed link to the QR page that works without the API key header</div>
           </div>
           <div class="endpoint">
             <span class="badge-method badge-post">POST</span>
             <span class="path">/api/sessions/:sessionId/pairing-code</span>
-            <div class="desc">Generate 8-digit pairing code (Body: <code>{"phoneNumber": "628123456789"}</code>)</div>
+            <div class="desc">Generate 8-digit pairing code (Body: <code>{"phoneNumber": "08123456789"}</code>, optional <code>countryCode</code>)</div>
           </div>
           <div class="endpoint">
             <span class="badge-method badge-get">GET</span>
             <span class="path">/api/sessions/:sessionId/status</span>
-            <div class="desc">Check device connection status (disconnected, qr_ready, connected)</div>
+            <div class="desc">Check device connection status (connecting, qr_ready, connected, reconnecting, disconnected) and disconnectReason</div>
           </div>
           <div class="endpoint">
             <span class="badge-method badge-get">GET</span>
@@ -224,18 +231,31 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Error handling middleware
+// Error handling middleware (body-parser sets status 400 for malformed JSON and 413 for oversized bodies)
 app.use((err, req, res, next) => {
-  console.error('[App Error]', err);
-  res.status(500).json({
+  const status = err.status || err.statusCode || 500;
+  if (status >= 500) {
+    console.error('[App Error]', err);
+  }
+  res.status(status).json({
     success: false,
     error: err.message || 'Internal Server Error'
   });
 });
 
+// Last line of defence: log stray promise rejections instead of letting Node kill every session
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process] Unhandled promise rejection:', reason);
+});
+
 // Start Server
 async function startServer() {
   try {
+    validateConfig();
+    if (!config.apiKey) {
+      console.warn('[Security] API_KEY is not set: the API is unauthenticated. Only acceptable for local development.');
+    }
+
     console.log('[Server] Connecting to PostgreSQL...');
     await initDatabase();
 

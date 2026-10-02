@@ -6,131 +6,105 @@ import {
   downloadMediaByMessageId
 } from '../services/sessionManager.js';
 import { query } from '../database/db.js';
+import { config } from '../config/index.js';
+import { AppError, sendError } from '../utils/errors.js';
+import { assertSessionId, parseOptionalInt } from '../utils/validation.js';
+
+function parseSendOptions(body) {
+  return {
+    delayMs: parseOptionalInt(body.delayMs, { name: 'delayMs', min: 0, max: config.antiBan.maxRequestDelayMs }),
+    countryCode: body.countryCode === undefined || body.countryCode === '' ? undefined : String(body.countryCode)
+  };
+}
 
 export async function sendText(req, res) {
   try {
-    const { sessionId, to, text, delayMs } = req.body;
+    const { sessionId, to, text } = req.body;
 
     if (!sessionId || !to || !text) {
-      return res.status(400).json({
-        success: false,
-        error: 'Required fields missing: sessionId, to, text are required.'
-      });
+      throw new AppError(400, 'Required fields missing: sessionId, to, text are required.');
     }
+    assertSessionId(sessionId);
 
-    const result = await sendTextMessage(sessionId, to, text, { delayMs });
-
+    const result = await sendTextMessage(sessionId, to, text, parseSendOptions(req.body));
     return res.status(200).json(result);
   } catch (error) {
-    console.error('[MessageController] sendText error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'MessageController');
   }
 }
 
 export async function sendImage(req, res) {
   try {
-    const { sessionId, to, caption, imageUrl, delayMs } = req.body;
-    let imageInput = imageUrl;
-
+    const { sessionId, to, caption, imageUrl } = req.body;
     // Support multipart file upload as fallback
-    if (req.file) {
-      imageInput = req.file.buffer;
-    }
+    const imageInput = req.file ? req.file.buffer : imageUrl;
 
     if (!sessionId || !to || !imageInput) {
-      return res.status(400).json({
-        success: false,
-        error: 'Required fields missing: sessionId, to, and imageUrl (or file upload) are required.'
-      });
+      throw new AppError(400, 'Required fields missing: sessionId, to, and imageUrl (or file upload) are required.');
     }
+    assertSessionId(sessionId);
 
-    const result = await sendImageMessage(sessionId, to, imageInput, caption || '', { delayMs });
-
+    const result = await sendImageMessage(sessionId, to, imageInput, caption || '', parseSendOptions(req.body));
     return res.status(200).json(result);
   } catch (error) {
-    console.error('[MessageController] sendImage error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'MessageController');
   }
 }
 
 export async function sendAttachment(req, res) {
   try {
-    const { sessionId, to, attachmentUrl, fileName, mimetype, caption, delayMs } = req.body;
-    let docInput = attachmentUrl;
-    let resolvedFileName = fileName;
-    let resolvedMimetype = mimetype;
-
-    if (req.file) {
-      docInput = req.file.buffer;
-      resolvedFileName = resolvedFileName || req.file.originalname;
-      resolvedMimetype = resolvedMimetype || req.file.mimetype;
-    }
+    const { sessionId, to, attachmentUrl, fileName, mimetype, caption } = req.body;
+    const docInput = req.file ? req.file.buffer : attachmentUrl;
 
     if (!sessionId || !to || !docInput) {
-      return res.status(400).json({
-        success: false,
-        error: 'Required fields missing: sessionId, to, and attachmentUrl (or file upload) are required.'
-      });
+      throw new AppError(400, 'Required fields missing: sessionId, to, and attachmentUrl (or file upload) are required.');
     }
+    assertSessionId(sessionId);
 
     const result = await sendAttachmentMessage(
       sessionId,
       to,
       docInput,
-      resolvedFileName || 'file',
-      resolvedMimetype || 'application/octet-stream',
+      fileName || req.file?.originalname || 'file',
+      mimetype || req.file?.mimetype || null,
       caption || '',
-      { delayMs }
+      parseSendOptions(req.body)
     );
-
     return res.status(200).json(result);
   } catch (error) {
-    console.error('[MessageController] sendAttachment error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'MessageController');
   }
 }
 
 export async function sendPairingCode(req, res) {
   try {
-    const { sessionId, phoneNumber } = req.body;
+    const { sessionId, phoneNumber, countryCode } = req.body;
 
     if (!sessionId || !phoneNumber) {
-      return res.status(400).json({
-        success: false,
-        error: 'sessionId and phoneNumber are required.'
-      });
+      throw new AppError(400, 'sessionId and phoneNumber are required.');
     }
+    assertSessionId(sessionId);
 
-    const code = await requestPairingCode(sessionId, phoneNumber);
+    const { code, phoneNumber: normalizedPhone } = await requestPairingCode(sessionId, phoneNumber, { countryCode });
 
     return res.status(200).json({
       success: true,
       sessionId,
-      phoneNumber,
+      phoneNumber: normalizedPhone,
       pairingCode: code,
       message: 'WhatsApp pairing code generated successfully.'
     });
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'MessageController');
   }
 }
 
 export async function getMessages(req, res) {
   try {
     const { sessionId } = req.params;
-    const { limit = 50, offset = 0, remoteJid, type } = req.query;
+    const { remoteJid, type } = req.query;
+    const limit = parseOptionalInt(req.query.limit, { name: 'limit', min: 1, max: 200, defaultValue: 50 });
+    const offset = parseOptionalInt(req.query.offset, { name: 'offset', min: 0, max: Number.MAX_SAFE_INTEGER, defaultValue: 0 });
 
     let sql = `SELECT * FROM messages WHERE session_id = $1`;
     const params = [sessionId];
@@ -146,7 +120,7 @@ export async function getMessages(req, res) {
     }
 
     sql += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(parseInt(limit, 10), parseInt(offset, 10));
+    params.push(limit, offset);
 
     const result = await query(sql, params);
 
@@ -157,7 +131,7 @@ export async function getMessages(req, res) {
       messages: result.rows
     });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'MessageController');
   }
 }
 
@@ -185,11 +159,6 @@ export async function downloadMedia(req, res) {
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(media.fileName)}"`);
     return res.send(media.buffer);
   } catch (error) {
-    console.error('[MessageController] downloadMedia error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'MessageController');
   }
 }
-

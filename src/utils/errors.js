@@ -1,0 +1,18 @@
+/**
+ * Error with an HTTP status code. Anything else that reaches a controller is treated as a 500.
+ */
+export class AppError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = 'AppError';
+    this.status = status;
+  }
+}
+
+export function sendError(res, error, context) {
+  const status = error instanceof AppError ? error.status : 500;
+  if (status >= 500) {
+    console.error(`[${context}]`, error);
+  }
+  return res.status(status).json({ success: false, error: error.message });
+}

@@ -47,16 +47,22 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
 │   │   └── postgresAuthState.js # Baileys Auth Store adapter ke PostgreSQL
 │   ├── services/
 │   │   ├── sessionManager.js # Core Multi-device, Baileys socket, anti-ban presence
+│   │   ├── reconnectPolicy.js # Keputusan reconnect/stop per kode disconnect
+│   │   ├── webhookUrlResolver.js # Resolusi URL webhook per session (dengan cache)
 │   │   └── webhookService.js # Message parser & Webhook dispatcher
 │   ├── controllers/
 │   │   ├── sessionController.js # Handler API session & QR
 │   │   └── messageController.js # Handler API kirim pesan & riwayat
 │   ├── middlewares/
-│   │   └── auth.js          # Middleware API Key
+│   │   └── auth.js          # API key (header) & signed QR link
+│   ├── utils/               # Validasi, normalisasi nomor, guard SSRF, cache, lock
+│   ├── views/
+│   │   └── sessionPages.js  # Halaman HTML QR/status
 │   └── routes/
 │       ├── index.js
 │       ├── sessionRoutes.js
 │       └── messageRoutes.js
+└── test/                    # Unit & integration test (node --test)
 ```
 
 ---
@@ -65,6 +71,12 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
 
 ### Opsi 1: Menggunakan Docker Compose (Direkomendasikan)
 
+0. Buat file `.env` dan isi `API_KEY` (wajib, minimal 16 karakter — compose menolak start tanpa ini):
+   ```bash
+   cp .env.example .env
+   # contoh membuat key acak:
+   openssl rand -hex 24
+   ```
 1. Jalankan container:
    ```bash
    docker compose up -d --build
@@ -92,6 +104,19 @@ WhatsApp Gateway REST API berbasis Node.js dan `@whiskeysockets/baileys` dengan 
    ```bash
    npm run dev
    ```
+5. Jalankan test:
+   ```bash
+   npm test
+   ```
+
+---
+
+## 🔐 Autentikasi
+
+- Semua endpoint (kecuali `/api/health`) membutuhkan header **`x-api-key: <API_KEY>`**. API key lewat query string (`?apiKey=`) **tidak lagi diterima** karena bocor ke log dan riwayat browser.
+- Dengan `NODE_ENV=production`, server menolak start kalau `API_KEY` kosong atau kurang dari 16 karakter.
+- Halaman QR di browser tidak bisa mengirim header, jadi dipakai **signed link** berumur pendek (default 10 menit, `QR_LINK_TTL_SECONDS`) yang hanya berlaku untuk satu session. Link ini dikembalikan di field `qrPage.url` oleh `POST /api/sessions/init` dan `POST /api/sessions/:sessionId/qr-link`.
+- `sessionId` hanya boleh berisi huruf, angka, `.`, `_`, `-` (maksimal 64 karakter).
 
 ---
 
@@ -112,12 +137,28 @@ Membuat dan mengaktifkan instance WhatsApp baru.
 
 ---
 
-### 2. Dapatkan QR Code untuk Scan
-Mendapatkan QR Code untuk pairing device.
+Response berisi `qrPage.url`, yaitu signed link ke halaman QR:
+```json
+{
+  "success": true,
+  "session": { "sessionId": "sales-01", "status": "qr_ready", "...": "..." },
+  "qrPage": {
+    "url": "/api/sessions/sales-01/qr?format=html&token=1790954521.6aR3Qi...",
+    "expiresAt": "2026-10-02T15:22:01.000Z"
+  }
+}
+```
 
-- **Endpoint (JSON Base64)**: `GET /api/sessions/:sessionId/qr`
-- **Endpoint (Tampilan Browser Web)**: `GET /api/sessions/:sessionId/qr?format=html`
-  > Buka URL `http://localhost:3000/api/sessions/sales-01/qr?format=html` di browser untuk langsung scan dari aplikasi WhatsApp di HP Anda.
+---
+
+### 2. Dapatkan QR Code untuk Scan
+Mendapatkan QR Code untuk pairing device. Endpoint ini **tidak** membuat atau menyalakan session: jalankan `POST /api/sessions/init` dulu (session yang belum ada → `404`, session yang tidak berjalan → `409`).
+
+- **Endpoint (JSON Base64)**: `GET /api/sessions/:sessionId/qr` (header `x-api-key`)
+- **Endpoint (Tampilan Browser Web)**: buka `qrPage.url` dari response init di browser, misalnya `http://localhost:3000/api/sessions/sales-01/qr?format=html&token=...`
+- **Link baru** (kalau link lama kedaluwarsa): `POST /api/sessions/:sessionId/qr-link`
+
+Session yang belum di-scan akan berhenti sendiri saat QR habis (sekitar 2,5 menit, `disconnectReason: "pairing_timeout"`). Jalankan `POST /api/sessions/init` lagi untuk QR baru.
 
 ---
 
@@ -125,10 +166,10 @@ Mendapatkan QR Code untuk pairing device.
 Menghubungkan WhatsApp menggunakan kode 8 digit.
 
 - **Endpoint**: `POST /api/sessions/:sessionId/pairing-code`
-- **Request Body**:
+- **Request Body** (`phoneNumber` boleh format lokal `08…`, `countryCode` opsional, default `DEFAULT_COUNTRY_CODE`):
   ```json
   {
-    "phoneNumber": "628123456789"
+    "phoneNumber": "08123456789"
   }
   ```
 - **Response**:
@@ -153,11 +194,26 @@ Menghubungkan WhatsApp menggunakan kode 8 digit.
     "session": {
       "sessionId": "sales-01",
       "status": "connected",
+      "disconnectReason": null,
       "phoneNumber": "628123456789",
       "webhookUrl": "https://your-domain.com/webhook"
     }
   }
   ```
+- **Status**: `connecting`, `qr_ready`, `connected`, `reconnecting` (menunggu backoff), `disconnected`.
+- **`disconnectReason`** (alasan terakhir session berhenti):
+
+  | Nilai | Arti | Yang dilakukan gateway |
+  |---|---|---|
+  | `connection_lost` | Koneksi putus (jaringan, timeout, server WA) | Reconnect otomatis dengan backoff eksponensial (2 detik s/d 5 menit) |
+  | `restart_required` | Restart normal setelah scan QR | Reconnect langsung |
+  | `pairing_timeout` | QR/pairing code tidak dipakai sampai habis | Berhenti; panggil `init` lagi |
+  | `logged_out` | Device dihapus dari HP / logout | Auth dihapus; perlu pairing ulang |
+  | `connection_replaced` | Nomor yang sama tersambung di socket lain (conflict 440) | Berhenti (tidak saling rebut) |
+  | `forbidden` | Akun diblokir/dibatasi WhatsApp (403) | Berhenti |
+  | `multidevice_mismatch` | Perlu pairing ulang (411) | Berhenti |
+  | `client_version_rejected` | Versi WA Web ditolak (405) | Berhenti; update Baileys atau set `WA_VERSION` |
+  | `not_restored` | Session belum di-pair saat server restart | Panggil `init` lagi |
 
 ---
 
@@ -174,11 +230,14 @@ Otomatis mengirim sinyal `composing` (sedang mengetik) selama 1-3 detik sebelum 
     "delayMs": 2000
   }
   ```
+- **`to`** menerima `08123456789`, `628123456789`, `+62 812-3456-789`, atau JID (`...@s.whatsapp.net`, `...@g.us`, `...@lid`). Awalan `0` diganti `countryCode` (default `62`); kirim `"countryCode": "60"` untuk nomor lokal negara lain, atau `"0"` untuk mematikan konversi.
+- **`delayMs`** (opsional, 0–15000): lama indikator "mengetik". Tanpa `delayMs`, durasi dihitung dari panjang teks.
+- **Error**: `400` input tidak valid, `409` session tidak connected.
 
 ---
 
 ### 6. Kirim Gambar (Image)
-Mendukung URL gambar, Base64, atau upload file (`multipart/form-data`).
+Mendukung URL gambar, Base64, atau upload file (`multipart/form-data`). URL di-download oleh gateway (maksimal `MEDIA_MAX_BYTES`) dan ditolak kalau mengarah ke alamat privat/lokal (lihat `ALLOW_PRIVATE_URLS`).
 
 - **Endpoint**: `POST /api/messages/send-image`
 - **Request Body (JSON)**:
@@ -275,12 +334,55 @@ Jika pesan berupa gambar (`image`):
 
 ---
 
+Event `connection.update` saat koneksi tertutup:
+```json
+{
+  "event": "connection.update",
+  "sessionId": "sales-01",
+  "data": {
+    "status": "reconnecting",
+    "statusCode": 428,
+    "reason": "Connection Closed",
+    "disconnectReason": "connection_lost",
+    "retryInMs": 3412
+  }
+}
+```
+
+Perubahan `webhookUrl` lewat `PUT /api/sessions/:sessionId/webhook` langsung berlaku (maksimal 30 detik cache), tanpa restart session.
+
+---
+
+## ⚙️ Konfigurasi (`.env`)
+
+Lihat `.env.example` untuk daftar lengkap.
+
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `API_KEY` | – | Wajib di production (≥16 karakter). Dikirim lewat header `x-api-key`. |
+| `QR_LINK_TTL_SECONDS` | `600` | Umur signed link halaman QR. |
+| `DEFAULT_COUNTRY_CODE` | `62` | Pengganti awalan `0` pada nomor lokal. |
+| `ALLOW_PRIVATE_URLS` | `false` | Izinkan URL media/webhook ke alamat privat/lokal. Set `true` kalau webhook diarahkan ke service internal, misalnya `http://n8n:5678/...` di network docker yang sama. |
+| `MEDIA_MAX_BYTES` | `52428800` | Batas ukuran media yang di-download dari URL. |
+| `WA_VERSION` | (bawaan Baileys) | Override versi WA Web, hanya kalau WhatsApp menolak versi bawaan (`client_version_rejected`). |
+| `RECONNECT_BASE_DELAY_MS` / `RECONNECT_MAX_DELAY_MS` | `2000` / `300000` | Backoff reconnect untuk session yang sudah di-pair. |
+| `RESTORE_STAGGER_MS` | `1500` | Jeda antar session saat restore ketika server start. |
+| `MIN_TYPING_DELAY_MS` / `MAX_TYPING_DELAY_MS` | `1000` / `2500` | Rentang durasi indikator "mengetik". |
+| `MAX_REQUEST_DELAY_MS` | `15000` | Batas atas field `delayMs` per request. |
+| `AUTO_READ_MESSAGES` | `false` | Tandai pesan masuk sebagai dibaca (centang biru). |
+
+Port PostgreSQL di `docker-compose.yml` hanya di-bind ke `127.0.0.1`.
+
+---
+
 ## 🛡️ Pengaturan Anti-Ban & Human Simulation
 
 Di file `.env` / `docker-compose.yml`:
 - `MIN_TYPING_DELAY_MS=1200` (Jeda minimal mengetik sebelum kirim pesan)
 - `MAX_TYPING_DELAY_MS=3000` (Jeda maksimal mengetik)
 - `AUTO_READ_MESSAGES=true` (Otomatis menandai pesan masuk sebagai telah dibaca / centang biru)
+
+> Catatan: indikator mengetik hanya sinyal lemah. Yang paling berpengaruh terhadap ban adalah kecepatan kirim, mengirim ke nomor yang belum pernah chat, dan laporan spam dari penerima.
 
 ---
 

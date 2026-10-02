@@ -1,6 +1,17 @@
 import axios from 'axios';
 import { query } from '../database/db.js';
 import { config } from '../config/index.js';
+import { createWebhookUrlResolver } from './webhookUrlResolver.js';
+import { assertSafeUrl, safeRequestOptions } from '../utils/netGuard.js';
+
+const webhookUrlResolver = createWebhookUrlResolver({ query, globalWebhookUrl: config.globalWebhookUrl });
+
+/**
+ * Drops the cached webhook URL of a session after it was changed.
+ */
+export function invalidateWebhookUrl(sessionId) {
+  webhookUrlResolver.invalidate(sessionId);
+}
 
 /**
  * Parses a Baileys WAMessage into a standardized format with message type classification
@@ -162,24 +173,15 @@ export function extractMessageData(msg) {
 }
 
 /**
- * Dispatches webhook event to configured destination URL
+ * Dispatches webhook event to the session's webhook URL (or the global one). Never throws.
  */
-export async function sendWebhookEvent(sessionId, eventType, payload, customWebhookUrl = null) {
-  let targetUrl = customWebhookUrl;
-
-  if (!targetUrl) {
-    try {
-      const res = await query('SELECT webhook_url FROM sessions WHERE id = $1', [sessionId]);
-      if (res.rows.length > 0 && res.rows[0].webhook_url) {
-        targetUrl = res.rows[0].webhook_url;
-      }
-    } catch (err) {
-      console.error(`[Webhook] Failed to fetch webhook_url for ${sessionId}:`, err.message);
-    }
-  }
-
-  if (!targetUrl) {
-    targetUrl = config.globalWebhookUrl;
+export async function sendWebhookEvent(sessionId, eventType, payload) {
+  let targetUrl;
+  try {
+    targetUrl = await webhookUrlResolver.resolve(sessionId);
+  } catch (err) {
+    console.error(`[Webhook] Failed to resolve webhook URL for ${sessionId}:`, err.message);
+    targetUrl = config.globalWebhookUrl || null;
   }
 
   if (!targetUrl) {
@@ -194,12 +196,15 @@ export async function sendWebhookEvent(sessionId, eventType, payload, customWebh
   };
 
   try {
+    assertSafeUrl(targetUrl, { allowPrivate: config.allowPrivateUrls, label: 'Webhook URL' });
     const response = await axios.post(targetUrl, body, {
       timeout: 10000,
+      maxRedirects: 0,
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'WhatsApp-Gateway-Webhook/1.0'
-      }
+      },
+      ...safeRequestOptions({ allowPrivate: config.allowPrivateUrls })
     });
 
     await query(

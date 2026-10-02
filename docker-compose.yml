@@ -7,8 +7,9 @@ services:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
       POSTGRES_DB: ${DB_NAME:-whatsapp_gateway}
+    # Bound to localhost only: the gateway reaches the database over the compose network
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -30,7 +31,12 @@ services:
       PORT: 3000
       HOST: 0.0.0.0
       NODE_ENV: production
-      API_KEY: ${API_KEY:-}
+      API_KEY: ${API_KEY:?Set API_KEY (min. 16 characters) in .env}
+      QR_LINK_TTL_SECONDS: ${QR_LINK_TTL_SECONDS:-600}
+      DEFAULT_COUNTRY_CODE: ${DEFAULT_COUNTRY_CODE:-62}
+      ALLOW_PRIVATE_URLS: ${ALLOW_PRIVATE_URLS:-false}
+      MEDIA_MAX_BYTES: ${MEDIA_MAX_BYTES:-52428800}
+      WA_VERSION: ${WA_VERSION:-}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: ${DB_USER:-postgres}

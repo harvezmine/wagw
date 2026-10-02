@@ -2,6 +2,7 @@ import express from 'express';
 import sessionRoutes from './sessionRoutes.js';
 import messageRoutes from './messageRoutes.js';
 import { apiKeyAuth } from '../middlewares/auth.js';
+import { config } from '../config/index.js';
 
 const router = express.Router();
 
@@ -14,17 +15,19 @@ router.get('/health', (req, res) => {
   });
 });
 
-// Test Webhook Receiver Endpoint for convenient debugging
-router.post('/webhook-test', (req, res) => {
-  console.log('----------------------------------------------------');
-  console.log('[Webhook Test Receiver] Received Payload:');
-  console.log(JSON.stringify(req.body, null, 2));
-  console.log('----------------------------------------------------');
-  res.status(200).json({ received: true });
-});
+// Unauthenticated test webhook receiver for local debugging only
+if (config.nodeEnv !== 'production') {
+  router.post('/webhook-test', (req, res) => {
+    console.log('----------------------------------------------------');
+    console.log('[Webhook Test Receiver] Received Payload:');
+    console.log(JSON.stringify(req.body, null, 2));
+    console.log('----------------------------------------------------');
+    res.status(200).json({ received: true });
+  });
+}
 
-// Protect routes with optional API key auth
-router.use('/sessions', apiKeyAuth, sessionRoutes);
+// Session routes apply auth themselves (the QR page also accepts signed links)
+router.use('/sessions', sessionRoutes);
 router.use('/messages', apiKeyAuth, messageRoutes);
 
 export default router;

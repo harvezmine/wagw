@@ -2,24 +2,37 @@ import {
   initSession as initSessionService,
   getSessionStatus,
   getAllSessions,
+  isSessionRunning,
   requestPairingCode as requestPairingCodeService,
   logoutSession,
-  deleteSession as deleteSessionService
+  deleteSession as deleteSessionService,
+  setSessionWebhookUrl
 } from '../services/sessionManager.js';
-import { query } from '../database/db.js';
+import { createQrLinkToken } from '../middlewares/auth.js';
+import { config } from '../config/index.js';
+import { AppError, sendError } from '../utils/errors.js';
+import { assertSessionId } from '../utils/validation.js';
+import { renderConnectedPage, renderInitializingPage, renderMessagePage, renderQrPage } from '../views/sessionPages.js';
+
+/**
+ * Browser link to the QR page. With an API key configured it carries a signed token that only
+ * works for this session and expires after QR_LINK_TTL_SECONDS.
+ */
+function buildQrPageLink(sessionId) {
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/qr?format=html`;
+  if (!config.apiKey) {
+    return { url: path, expiresAt: null };
+  }
+  const { token, expiresAt } = createQrLinkToken(sessionId);
+  return { url: `${path}&token=${encodeURIComponent(token)}`, expiresAt };
+}
 
 export async function initSession(req, res) {
   try {
     const { sessionId, customName, webhookUrl } = req.body;
+    assertSessionId(sessionId);
 
-    if (!sessionId) {
-      return res.status(400).json({
-        success: false,
-        error: 'sessionId is required in request body.'
-      });
-    }
-
-    const result = await initSessionService(sessionId, { customName, webhookUrl });
+    await initSessionService(sessionId, { customName, webhookUrl });
 
     // Allow quick delay for initial QR generation
     await new Promise((r) => setTimeout(r, 1000));
@@ -28,191 +41,105 @@ export async function initSession(req, res) {
     return res.status(200).json({
       success: true,
       message: 'Session initialization triggered.',
-      session: status
+      session: status,
+      qrPage: buildQrPageLink(sessionId)
     });
   } catch (error) {
-    console.error('[SessionController] initSession error:', error);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function createQrLink(req, res) {
+  try {
+    const { sessionId } = req.params;
+    const status = await getSessionStatus(sessionId);
+    if (!status.exists) {
+      throw new AppError(404, `Session "${sessionId}" not found.`);
+    }
+    return res.status(200).json({ success: true, sessionId, qrPage: buildQrPageLink(sessionId) });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
   }
 }
 
 export async function getQrCode(req, res) {
   try {
     const { sessionId } = req.params;
-    const { format } = req.query; // 'html', 'image' or 'json'
+    const wantsHtml = req.query.format === 'html' || req.query.format === 'image';
     let status = await getSessionStatus(sessionId);
 
-    // Auto-init if session doesn't exist, is disconnected, or not active
-    if (!status.exists || status.status === 'disconnected' || status.status === 'not_found') {
-      try {
-        await initSessionService(sessionId, { customName: status.customName || '', webhookUrl: status.webhookUrl || null });
-      } catch (initErr) {
-        console.error(`[SessionController] Auto-init failed for session ${sessionId}:`, initErr);
-      }
+    if (!status.exists) {
+      const error = `Session "${sessionId}" not found. Create it first with POST /api/sessions/init.`;
+      return wantsHtml
+        ? res.status(404).send(renderMessagePage(sessionId, { title: 'Session not found', message: error }))
+        : res.status(404).json({ success: false, error });
     }
 
-    // Wait up to 3 seconds for QR code or connection ready
-    let attempts = 0;
-    while (attempts < 6) {
-      status = await getSessionStatus(sessionId);
-      if (status.status === 'connected' || status.qrCode) {
-        break;
-      }
+    // Reading the QR never starts a session. A running one gets up to 3 seconds to produce a QR.
+    if (!isSessionRunning(sessionId)) {
+      const error = status.status === 'reconnecting'
+        ? 'Session is reconnecting. Try again shortly.'
+        : 'Session is not running. Start it with POST /api/sessions/init.';
+      return wantsHtml
+        ? res.status(409).send(renderMessagePage(sessionId, { title: 'Session not running', message: error, refreshMs: 5000 }))
+        : res.status(409).json({ success: false, status: status.status, disconnectReason: status.disconnectReason, error });
+    }
+
+    for (let attempt = 0; attempt < 6 && status.status !== 'connected' && !status.qrCode; attempt++) {
       await new Promise((r) => setTimeout(r, 500));
-      attempts++;
-    }
-
-    if (format === 'html' || format === 'image') {
-      if (status.status === 'connected') {
-        return res.send(`
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>WhatsApp Connected - ${sessionId}</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0b141a; color: #e9edef; }
-              .card { background: #111b21; padding: 2.5rem 2rem; border-radius: 16px; box-shadow: 0 4px 25px rgba(0,0,0,0.6); text-align: center; max-width: 380px; width: 90%; }
-              .icon { font-size: 3rem; margin-bottom: 0.8rem; color: #25d366; }
-              h2 { margin: 0 0 10px; color: #e9edef; }
-              p { font-size: 0.9rem; color: #8696a0; line-height: 1.5; margin-bottom: 20px; }
-              .badge { background: #005c4b; color: #25d366; padding: 6px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: bold; display: inline-block; margin-bottom: 15px; }
-              .phone-box { background: #202c33; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 1.1rem; color: #25d366; }
-            </style>
-          </head>
-          <body>
-            <div class="card">
-              <div class="icon">✓</div>
-              <span class="badge">Session: ${sessionId}</span>
-              <h2>WhatsApp Connected</h2>
-              <p>Your WhatsApp device is successfully linked and active.</p>
-              <div class="phone-box">${status.phoneNumber ? '+' + status.phoneNumber : 'Device Connected'}</div>
-            </div>
-          </body>
-          </html>
-        `);
-      }
-
-      if (!status.qrCode) {
-        return res.send(`
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>Starting WhatsApp Session - ${sessionId}</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0b141a; color: #e9edef; }
-              .card { background: #111b21; padding: 2.5rem 2rem; border-radius: 16px; box-shadow: 0 4px 25px rgba(0,0,0,0.6); text-align: center; max-width: 380px; width: 90%; }
-              .spinner { width: 48px; height: 48px; border: 4px solid #202c33; border-top: 4px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto; }
-              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-              h2 { margin: 0 0 10px; color: #25d366; }
-              p { font-size: 0.9rem; color: #8696a0; line-height: 1.5; }
-              .badge { background: #202c33; color: #8696a0; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; }
-            </style>
-            <script>
-              setTimeout(() => location.reload(), 2000);
-            </script>
-          </head>
-          <body>
-            <div class="card">
-              <span class="badge">Session: ${sessionId}</span>
-              <div class="spinner"></div>
-              <h2>Initializing WhatsApp...</h2>
-              <p>Starting connection and preparing QR code. This page will refresh automatically in 2 seconds.</p>
-            </div>
-          </body>
-          </html>
-        `);
-      }
-
-      return res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <title>Scan WhatsApp QR - ${sessionId}</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0b141a; color: #e9edef; }
-            .card { background: #111b21; padding: 2rem; border-radius: 16px; box-shadow: 0 4px 25px rgba(0,0,0,0.6); text-align: center; max-width: 380px; width: 90%; }
-            h2 { margin-top: 0; color: #25d366; }
-            img { width: 260px; height: 260px; border-radius: 8px; background: #fff; padding: 8px; margin: 15px 0; }
-            p { font-size: 0.9rem; color: #8696a0; line-height: 1.4; }
-            .badge { background: #005c4b; color: #25d366; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; }
-          </style>
-          <script>
-            setTimeout(() => location.reload(), 15000);
-          </script>
-        </head>
-        <body>
-          <div class="card">
-            <span class="badge">Session: ${sessionId}</span>
-            <h2>Scan WhatsApp QR</h2>
-            <img src="${status.qrCode}" alt="WhatsApp QR Code" />
-            <p>1. Open WhatsApp on your phone<br>2. Tap Menu / Settings &gt; Linked Devices<br>3. Tap Link a Device and point your camera here</p>
-          </div>
-        </body>
-        </html>
-      `);
+      status = await getSessionStatus(sessionId);
     }
 
     if (status.status === 'connected') {
-      return res.status(200).json({
-        success: true,
-        status: 'connected',
-        phoneNumber: status.phoneNumber,
-        message: 'Device is already connected. QR code is not needed.'
-      });
+      return wantsHtml
+        ? res.send(renderConnectedPage(sessionId, status.phoneNumber))
+        : res.status(200).json({
+          success: true,
+          status: 'connected',
+          phoneNumber: status.phoneNumber,
+          message: 'Device is already connected. QR code is not needed.'
+        });
     }
 
     if (!status.qrCode) {
-      return res.status(200).json({
-        success: true,
-        status: status.status || 'connecting',
-        message: 'Session is initializing. QR code is not ready yet. Try again in 2 seconds.',
-        qrCode: null
-      });
+      return wantsHtml
+        ? res.send(renderInitializingPage(sessionId))
+        : res.status(200).json({
+          success: true,
+          status: status.status || 'connecting',
+          message: 'Session is initializing. QR code is not ready yet. Try again in 2 seconds.',
+          qrCode: null
+        });
     }
 
-    return res.status(200).json({
-      success: true,
-      sessionId,
-      status: status.status,
-      qrCode: status.qrCode
-    });
+    return wantsHtml
+      ? res.send(renderQrPage(sessionId, status.qrCode))
+      : res.status(200).json({ success: true, sessionId, status: status.status, qrCode: status.qrCode });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'SessionController');
   }
 }
 
 export async function requestPairingCode(req, res) {
   try {
     const { sessionId } = req.params;
-    const { phoneNumber } = req.body;
+    const { phoneNumber, countryCode } = req.body;
 
     if (!phoneNumber) {
-      return res.status(400).json({
-        success: false,
-        error: 'phoneNumber is required (e.g. 628123456789).'
-      });
+      throw new AppError(400, 'phoneNumber is required (e.g. 08123456789 or 628123456789).');
     }
 
-    const code = await requestPairingCodeService(sessionId, phoneNumber);
+    const { code, phoneNumber: normalizedPhone } = await requestPairingCodeService(sessionId, phoneNumber, { countryCode });
 
     return res.status(200).json({
       success: true,
       sessionId,
-      phoneNumber,
+      phoneNumber: normalizedPhone,
       pairingCode: code,
       instruction: 'Enter this 8-digit code in WhatsApp > Linked Devices > Link with phone number.'
     });
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return sendError(res, error, 'SessionController');
   }
 }
 
@@ -225,7 +152,7 @@ export async function getStatus(req, res) {
       session: status
     });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'SessionController');
   }
 }
 
@@ -238,16 +165,14 @@ export async function listSessions(req, res) {
       sessions
     });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'SessionController');
   }
 }
 
 export async function updateWebhook(req, res) {
   try {
     const { sessionId } = req.params;
-    const { webhookUrl } = req.body;
-
-    await query(`UPDATE sessions SET webhook_url = $1, updated_at = NOW() WHERE id = $2`, [webhookUrl, sessionId]);
+    const webhookUrl = await setSessionWebhookUrl(sessionId, req.body.webhookUrl);
 
     return res.status(200).json({
       success: true,
@@ -255,7 +180,7 @@ export async function updateWebhook(req, res) {
       webhookUrl
     });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'SessionController');
   }
 }
 
@@ -265,7 +190,7 @@ export async function logout(req, res) {
     const result = await logoutSession(sessionId);
     return res.status(200).json(result);
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'SessionController');
   }
 }
 
@@ -275,6 +200,6 @@ export async function deleteSession(req, res) {
     const result = await deleteSessionService(sessionId);
     return res.status(200).json(result);
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return sendError(res, error, 'SessionController');
   }
 }

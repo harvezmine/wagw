@@ -3,7 +3,8 @@
 CREATE TABLE IF NOT EXISTS sessions (
     id VARCHAR(100) PRIMARY KEY,
     phone_number VARCHAR(50),
-    status VARCHAR(50) DEFAULT 'disconnected', -- disconnected, connecting, qr_ready, connected
+    status VARCHAR(50) DEFAULT 'disconnected', -- disconnected, connecting, qr_ready, connected, reconnecting
+    disconnect_reason VARCHAR(100), -- why the session last stopped (logged_out, connection_replaced, pairing_timeout, ...)
     webhook_url TEXT,
     qr_code TEXT,
     custom_name VARCHAR(150),

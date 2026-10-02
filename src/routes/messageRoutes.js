@@ -8,6 +8,7 @@ import {
   getMessages,
   downloadMedia
 } from '../controllers/messageController.js';
+import { validateSessionIdParam } from '../utils/validation.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -15,6 +16,8 @@ const upload = multer({
 });
 
 const router = express.Router();
+
+router.param('sessionId', validateSessionIdParam);
 
 router.post('/send-text', sendText);
 router.post('/send-image', upload.single('file'), sendImage);
