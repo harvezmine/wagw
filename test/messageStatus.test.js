@@ -23,5 +23,6 @@ test('only allows forward transitions', () => {
 test('explains known WhatsApp rejection codes', () => {
   assert.match(describeAckError('463'), /463.*restricted/);
   assert.equal(describeAckError('999'), 'WhatsApp error 999');
+  assert.equal(describeAckError('475'), 'WhatsApp error 475');
   assert.equal(describeAckError(undefined), 'WhatsApp rejected the message');
 });

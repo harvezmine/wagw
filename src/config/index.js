@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { parseTimeWindow } from '../utils/timeWindow.js';
 dotenv.config();
 
 const nodeEnv = process.env.NODE_ENV || 'development';
@@ -19,6 +20,10 @@ function parseTrustProxy(value) {
 
 function envInt(name, defaultValue) {
   return parseInt(process.env[name] || String(defaultValue), 10);
+}
+
+function envFloat(name, defaultValue) {
+  return parseFloat(process.env[name] || String(defaultValue));
 }
 
 /**
@@ -49,7 +54,8 @@ export const config = {
   validate: {
     maxNumbers: envInt('VALIDATE_MAX_NUMBERS', 50),
     minIntervalMs: envInt('VALIDATE_MIN_INTERVAL_MS', 3000),
-    cacheTtlMs: envInt('VALIDATE_CACHE_DAYS', 7) * 24 * 60 * 60 * 1000
+    cacheTtlMs: envInt('VALIDATE_CACHE_DAYS', 7) * 24 * 60 * 60 * 1000,
+    dailyLimit: envInt('VALIDATE_DAILY_LIMIT', 200)
   },
   groups: {
     cacheTtlMs: envInt('GROUPS_CACHE_MINUTES', 10) * 60 * 1000,
@@ -92,6 +98,28 @@ export const config = {
     ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
   },
   globalWebhookUrl: process.env.GLOBAL_WEBHOOK_URL || '',
+  // Behaviour limits that keep the number below WhatsApp's restriction triggers (see README, "Anti-Ban Guard")
+  guard: {
+    newContactDailyLimit: envInt('NEW_CONTACT_DAILY_LIMIT', 20),
+    newContactIntervalMinMs: envInt('NEW_CONTACT_INTERVAL_MIN_MS', 60000),
+    newContactIntervalMaxMs: envInt('NEW_CONTACT_INTERVAL_MAX_MS', 180000),
+    newSessionCooldownMs: envInt('NEW_SESSION_COOLDOWN_HOURS', 72) * 60 * 60 * 1000,
+    reconnectWarmupMs: envInt('RECONNECT_WARMUP_MS', 120000),
+    restrictionPauseMs: envInt('RESTRICTION_PAUSE_HOURS', 24) * 60 * 60 * 1000,
+    campaignHours: process.env.CAMPAIGN_HOURS || '08:00-20:00',
+    campaignTimezone: process.env.CAMPAIGN_TIMEZONE || 'Asia/Jakarta',
+    campaignRecipientCooldownMs: envInt('CAMPAIGN_RECIPIENT_COOLDOWN_HOURS', 72) * 60 * 60 * 1000,
+    campaignRequireConsent: parseBoolean(process.env.CAMPAIGN_REQUIRE_CONSENT, true),
+    optOutKeywords: process.env.OPT_OUT_KEYWORDS || 'STOP,BERHENTI,UNSUBSCRIBE,UNSUB,STOP PROMO,BERHENTI PROMO',
+    optInKeywords: process.env.OPT_IN_KEYWORDS || 'START,SUBSCRIBE,LANGGANAN',
+    validateNewContacts: parseBoolean(process.env.VALIDATE_NEW_CONTACTS, true),
+    capPollMs: envInt('CAP_POLL_HOURS', 6) * 60 * 60 * 1000,
+    healthCheckIntervalMs: envInt('HEALTH_CHECK_INTERVAL_MS', 600000),
+    healthMinSample: envInt('HEALTH_MIN_SAMPLE', 20),
+    healthMinDeliveryRate: envFloat('HEALTH_MIN_DELIVERY_RATE', 0.6),
+    healthMinReplyRate: envFloat('HEALTH_MIN_REPLY_RATE', 0.05),
+    healthPauseMs: envInt('HEALTH_PAUSE_HOURS', 24) * 60 * 60 * 1000
+  },
   antiBan: {
     minTypingDelayMs: parseInt(process.env.MIN_TYPING_DELAY_MS || '1000', 10),
     maxTypingDelayMs: parseInt(process.env.MAX_TYPING_DELAY_MS || '2500', 10),
@@ -115,5 +143,18 @@ export function validateConfig(cfg = config) {
   }
   if (cfg.webhook.secret && cfg.webhook.secret.length < 16) {
     throw new Error('WEBHOOK_SECRET must be at least 16 characters long.');
+  }
+  try {
+    parseTimeWindow(cfg.guard.campaignHours);
+  } catch {
+    throw new Error(`CAMPAIGN_HOURS must look like 08:00-20:00 (got "${cfg.guard.campaignHours}").`);
+  }
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: cfg.guard.campaignTimezone });
+  } catch {
+    throw new Error(`CAMPAIGN_TIMEZONE must be an IANA time zone such as Asia/Jakarta (got "${cfg.guard.campaignTimezone}").`);
+  }
+  if (cfg.guard.newContactIntervalMinMs < 0 || cfg.guard.newContactIntervalMaxMs < cfg.guard.newContactIntervalMinMs) {
+    throw new Error('NEW_CONTACT_INTERVAL_MIN_MS must be >= 0 and NEW_CONTACT_INTERVAL_MAX_MS must be >= NEW_CONTACT_INTERVAL_MIN_MS.');
   }
 }

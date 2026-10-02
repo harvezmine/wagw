@@ -8,7 +8,16 @@ import { createWebhookDispatcher, createWebhookPoster } from './webhookDispatche
 import { toFonnteWebhook } from '../fonnte/fonnteWebhook.js';
 
 export const WEBHOOK_FORMATS = ['default', 'fonnte'];
-export const WEBHOOK_EVENTS = ['connection.update', 'message.received', 'message.status', 'account.restriction', 'call.received'];
+export const WEBHOOK_EVENTS = [
+  'connection.update',
+  'message.received',
+  'message.status',
+  'account.restriction',
+  'account.banned',
+  'session.paused',
+  'contact.consent',
+  'call.received'
+];
 
 const log = logger.child({ module: 'webhook' });
 

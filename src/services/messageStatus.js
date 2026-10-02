@@ -7,11 +7,10 @@ const PROGRESS = ['sent', 'delivered', 'read', 'played'];
 // WhatsApp NACK codes worth explaining to API clients
 const ACK_ERRORS = {
   463: 'account restricted from starting new chats (reach-out timelock or missing privacy token)',
-  475: 'new chat message limit reached',
   479: 'rejected by WhatsApp (stale device session or invalid addressing)'
 };
 
-export const QUEUE_STATUSES = ['queued', 'processing', 'sent', 'delivered', 'read', 'played', 'failed', 'cancelled', 'expired'];
+export const QUEUE_STATUSES = ['queued', 'processing', 'sent', 'delivered', 'read', 'played', 'failed', 'cancelled', 'expired', 'skipped'];
 
 export function ackToStatus(ack) {
   return ACK_TO_STATUS[ack] ?? null;
