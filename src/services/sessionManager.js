@@ -23,6 +23,10 @@ import { outboundQueue } from './outboundQueue.js';
 import { ackToStatus, allowedPreviousStatuses, describeAckError } from './messageStatus.js';
 import { MEDIA_TYPES, buildMessageContent, historyText, presenceFor } from './messageContent.js';
 import { normalizeSettings } from './sessionSettings.js';
+import { describeBan } from './banPolicy.js';
+import { antiBan } from './antiBan.js';
+import { guardStore } from './guardStore.js';
+import { matchConsentKeyword, parseKeywordList } from './consent.js';
 
 // Map of active in-memory sessions (at most one socket per session)
 const activeSessions = new Map();
@@ -37,6 +41,15 @@ const groupMetadataCaches = new Map();
 
 const RUNNING_STATUSES = new Set(['connecting', 'qr_ready', 'connected']);
 const PAIRING_READY_TIMEOUT_MS = 20000;
+
+const CONSENT_KEYWORDS = {
+  optOut: parseKeywordList(config.guard.optOutKeywords),
+  optIn: parseKeywordList(config.guard.optInKeywords)
+};
+
+// Guard state belongs to the paired number: a logout forgets it (the next pairing starts a new cool-down)
+const RESET_GUARDS = `paired_at = NULL, new_chats_paused_until = NULL, new_chats_pause_reason = NULL,
+  campaigns_paused_until = NULL, campaigns_pause_reason = NULL, chat_cap = NULL, ban_code = NULL, ban_expires_at = NULL`;
 
 // Application events, and Baileys internals (quiet by default, BAILEYS_LOG_LEVEL)
 const log = logger.child({ module: 'session' });
@@ -175,11 +188,16 @@ async function handleOpen(sessionData) {
     qrRaw: null,
     pairingCode: null,
     phoneNumber: phone,
-    reconnectAttempts: 0
+    reconnectAttempts: 0,
+    // Starts the warm-up before new chats (send gate)
+    connectedAt: new Date()
   });
 
+  // A pairing we did not see (isNewLogin) still starts the cool-down; a working connection ends any ban
   await query(
-    `UPDATE sessions SET status = 'connected', qr_code = NULL, disconnect_reason = NULL, phone_number = $1, updated_at = NOW() WHERE id = $2`,
+    `UPDATE sessions SET status = 'connected', qr_code = NULL, disconnect_reason = NULL, phone_number = $1,
+       paired_at = COALESCE(paired_at, NOW()), ban_code = NULL, ban_expires_at = NULL, updated_at = NOW()
+     WHERE id = $2`,
     [phone, sessionId]
   );
 
@@ -204,7 +222,9 @@ async function handleClose(sessionData, lastDisconnect) {
     ...config.reconnect
   });
   const status = decision.action === 'reconnect' ? 'reconnecting' : 'disconnected';
-  Object.assign(sessionData, { status, qrCode: null, qrRaw: null });
+  // 402/406 carry the ban reason code and remaining time in the failure attributes
+  const ban = describeBan(statusCode, lastDisconnect?.error?.data);
+  Object.assign(sessionData, { status, qrCode: null, qrRaw: null, connectedAt: null });
 
   log.warn(
     { sessionId, statusCode, action: decision.action, reason: decision.reason, retryInMs: decision.delayMs },
@@ -225,9 +245,12 @@ async function handleClose(sessionData, lastDisconnect) {
   }
 
   await query(
-    `UPDATE sessions SET status = $1, disconnect_reason = $2, qr_code = NULL, updated_at = NOW() WHERE id = $3`,
+    `UPDATE sessions SET status = $1, disconnect_reason = $2, qr_code = NULL, updated_at = NOW()
+       ${decision.action === 'logout' ? `, ${RESET_GUARDS}` : ''}
+     WHERE id = $3`,
     [status, decision.reason, sessionId]
   );
+  if (ban) await antiBan.recordBan(sessionId, ban);
 
   sendWebhookEvent(sessionId, 'connection.update', {
     status,
@@ -304,6 +327,28 @@ async function handleIncomingMessage(sessionData, msg) {
     contextInfo: parsed.contextInfo,
     timestamp: msg.messageTimestamp ? new Date(toNumber(msg.messageTimestamp) * 1000).toISOString() : new Date().toISOString()
   });
+
+  // Whole-message STOP/START keywords in 1:1 chats (stored after the message itself, so it does not
+  // count as writing again after the opt-out)
+  if (!fromMe && !isGroup && parsed.messageType === 'text') {
+    const consent = matchConsentKeyword(parsed.content, CONSENT_KEYWORDS);
+    if (consent) await handleConsentKeyword(sessionData, [remoteJid, remoteJidAlt].filter(Boolean), consent);
+  }
+}
+
+async function handleConsentKeyword(sessionData, jids, status) {
+  const { sessionId, settings } = sessionData;
+  await antiBan.recordConsent(sessionId, jids, status, 'keyword');
+  log.info({ sessionId, jid: jids[0], status }, 'Consent keyword received');
+  if (status === 'opted_out' && settings.optOutReply) {
+    await outboundQueue.enqueue({
+      sessionId,
+      targetJid: jids[0],
+      messageType: 'text',
+      category: 'reply',
+      payload: { text: settings.optOutReply }
+    });
+  }
 }
 
 /**
@@ -315,7 +360,14 @@ async function handleAck(sessionData, key, update) {
   if (!allowedPrevious.length) return;
 
   const { sessionId } = sessionData;
-  const error = status === 'failed' ? describeAckError(update.messageStubParameters?.[0]) : null;
+  const errorCode = status === 'failed' ? update.messageStubParameters?.[0] : null;
+  const error = status === 'failed' ? describeAckError(errorCode) : null;
+  if (String(errorCode) === '463') {
+    // WhatsApp refused to open a chat: pause new chats (never retried; retrying counts as another attempt)
+    antiBan.handleRestrictionAck(sessionId, sessionData.sock).catch((err) => {
+      log.error({ sessionId, err }, 'Failed to handle a 463 restriction');
+    });
+  }
   const [historyRes, queueItem] = await Promise.all([
     query(
       `UPDATE messages SET status = $3, updated_at = NOW()
@@ -354,6 +406,19 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   }
   if (webhookUrl) {
     assertSafeUrl(webhookUrl, { allowPrivate: config.allowPrivateUrls, label: 'webhookUrl' });
+  }
+
+  if (!isReconnect) {
+    const banned = await query(
+      `SELECT ban_expires_at FROM sessions WHERE id = $1 AND disconnect_reason = 'temporarily_banned' AND ban_expires_at > NOW()`,
+      [sessionId]
+    );
+    if (banned.rowCount) {
+      throw new AppError(
+        409,
+        `Session "${sessionId}" is temporarily banned by WhatsApp until ${banned.rows[0].ban_expires_at.toISOString()}. Connect again after that.`
+      );
+    }
   }
 
   const reconnectAttempts = isReconnect && existing ? existing.reconnectAttempts : 0;
@@ -458,13 +523,18 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   // Connection update listener
   on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    // Baileys v7 reports reach-out restrictions (the cause of error 463) through connection updates
-    if (update.reachoutTimeLock) {
-      sendWebhookEvent(sessionId, 'account.restriction', update.reachoutTimeLock);
-    }
     if (qr) await handleQr(sessionData, qr);
     if (connection === 'open') await handleOpen(sessionData);
     if (connection === 'close') await handleClose(sessionData, lastDisconnect);
+    // A fresh pairing starts the new-number cool-down
+    if (update.isNewLogin) await guardStore.setPairedAt(sessionId, new Date());
+    // Baileys v7 reports reach-out restrictions (the cause of error 463) through connection updates
+    if (update.reachoutTimeLock) await antiBan.applyReachoutTimelock(sessionId, update.reachoutTimeLock);
+  });
+
+  // WhatsApp's monthly new-chat quota (warnings, cap)
+  on('message-capping.update', async (info) => {
+    await antiBan.applyChatCap(sessionId, info);
   });
 
   // Incoming messages listener
@@ -518,6 +588,7 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
           sessionId,
           targetJid: call.from,
           messageType: 'text',
+          category: 'reply',
           payload: { text: rejectCallMessage }
         });
       }
@@ -578,6 +649,19 @@ export function getConnectedSessionIds() {
   return [...activeSessions.values()]
     .filter((session) => !session.stopped && session.status === 'connected')
     .map((session) => session.sessionId);
+}
+
+export function getConnectedSessionSockets() {
+  return [...activeSessions.values()]
+    .filter((session) => !session.stopped && session.status === 'connected')
+    .map((session) => ({ sessionId: session.sessionId, sock: session.sock }));
+}
+
+/** What the send gate needs from a running session: its settings and when it connected. */
+export function getSessionState(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session || session.stopped) return null;
+  return { settings: session.settings, connectedAt: session.connectedAt ?? null };
 }
 
 async function saveOutgoingMessage(session, jid, result, { messageType, content, mediaUrl = null }) {
@@ -776,6 +860,10 @@ export async function getSessionStatus(sessionId) {
     customName: row.custom_name,
     status: memorySession ? memorySession.status : row.status,
     disconnectReason: row.disconnect_reason,
+    ban:
+      row.disconnect_reason === 'banned' || row.disconnect_reason === 'temporarily_banned'
+        ? { permanent: row.disconnect_reason === 'banned', code: row.ban_code, expiresAt: row.ban_expires_at }
+        : null,
     phoneNumber: memorySession ? memorySession.phoneNumber : row.phone_number,
     qrCode: memorySession ? memorySession.qrCode : row.qr_code,
     pairingCode: memorySession ? memorySession.pairingCode : null,
@@ -875,7 +963,9 @@ export function logoutSession(sessionId) {
     groupMetadataCaches.delete(sessionId);
     groupLists.delete(sessionId);
     await query(
-      `UPDATE sessions SET status = 'disconnected', disconnect_reason = 'logged_out', qr_code = NULL, phone_number = NULL, updated_at = NOW() WHERE id = $1`,
+      `UPDATE sessions SET status = 'disconnected', disconnect_reason = 'logged_out', qr_code = NULL, phone_number = NULL,
+         ${RESET_GUARDS}, updated_at = NOW()
+       WHERE id = $1`,
       [sessionId]
     );
     return { success: true, message: `Session ${sessionId} logged out.` };

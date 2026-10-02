@@ -41,14 +41,15 @@ export function isActiveConversation(contact, now = new Date()) {
 /**
  * Why a message must not go to this recipient, or null when it may.
  * `contact` is `{ lastInboundAt, consent: { status, updatedAt } | null }`.
- * An opt-out stands until the person writes again afterwards; a reply inside an active conversation is
- * still allowed (e.g. confirming the opt-out).
+ * An opt-out blocks campaigns until the person opts in again. Other messages are blocked until the person
+ * writes again afterwards; a reply inside an active conversation is still allowed (e.g. confirming the opt-out).
  */
 export function consentBlockReason({ category, isGroup, contact, requireConsent, now = new Date() }) {
   if (isGroup) return null;
   const consent = contact?.consent;
   const lastInbound = contact?.lastInboundAt ? new Date(contact.lastInboundAt) : null;
   if (consent?.status === 'opted_out') {
+    if (category === 'campaign') return 'recipient opted out';
     const wroteAgain = lastInbound && lastInbound > new Date(consent.updatedAt);
     const activeReply = category === 'reply' && isActiveConversation(contact, now);
     if (!wroteAgain && !activeReply) return 'recipient opted out';

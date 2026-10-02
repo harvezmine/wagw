@@ -24,11 +24,13 @@ test('an active conversation means the recipient wrote within 24 hours', () => {
   assert.equal(isActiveConversation(null, now), false);
 });
 
-test('opt-outs block everything except replies in an active conversation, until the person writes again', () => {
+test('opt-outs block campaigns until an opt-in, and other messages until the person writes again (replies excepted)', () => {
   const optedOut = { lastInboundAt: hoursAgo(48), consent: { status: 'opted_out', updatedAt: hoursAgo(47) } };
   assert.equal(consentBlockReason({ category: 'transactional', isGroup: false, contact: optedOut, requireConsent: false, now }), 'recipient opted out');
   const reengaged = { lastInboundAt: hoursAgo(1), consent: { status: 'opted_out', updatedAt: hoursAgo(47) } };
   assert.equal(consentBlockReason({ category: 'transactional', isGroup: false, contact: reengaged, requireConsent: false, now }), null);
+  // Writing again does not re-enrol someone in campaigns: that takes an explicit opt-in
+  assert.equal(consentBlockReason({ category: 'campaign', isGroup: false, contact: reengaged, requireConsent: false, now }), 'recipient opted out');
   const justStopped = { lastInboundAt: hoursAgo(1), consent: { status: 'opted_out', updatedAt: hoursAgo(0.9) } };
   assert.equal(consentBlockReason({ category: 'reply', isGroup: false, contact: justStopped, requireConsent: false, now }), null);
   assert.equal(consentBlockReason({ category: 'campaign', isGroup: false, contact: justStopped, requireConsent: false, now }), 'recipient opted out');
