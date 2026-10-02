@@ -1,8 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import { config, validateConfig } from './config/index.js';
-import { initDatabase } from './database/db.js';
-import { restoreSessions } from './services/sessionManager.js';
+import { initDatabase, pool } from './database/db.js';
+import { restoreSessions, shutdownSessions } from './services/sessionManager.js';
 import apiRoutes from './routes/index.js';
 import { logger } from './utils/logger.js';
 import { outboundQueue } from './services/outboundQueue.js';
@@ -10,6 +10,7 @@ import { queueRunner } from './services/messageService.js';
 import { webhookDispatcher } from './services/webhookService.js';
 
 const app = express();
+let server = null;
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -273,7 +274,7 @@ async function startServer() {
     queueRunner.start();
     webhookDispatcher.start();
 
-    app.listen(config.port, config.host, () => {
+    server = app.listen(config.port, config.host, () => {
       logger.info({ url: `http://${config.host}:${config.port}`, docs: `http://localhost:${config.port}/` }, 'WhatsApp Web Gateway is running');
     });
   } catch (error) {
@@ -281,5 +282,39 @@ async function startServer() {
     process.exit(1);
   }
 }
+
+let shuttingDown = false;
+
+/**
+ * SIGTERM/SIGINT: stop accepting requests, finish the message being sent, close WhatsApp sockets
+ * without logging out (they are restored on the next start), flush webhooks, close the DB pool.
+ */
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'Shutting down gracefully');
+  const forceExit = setTimeout(() => {
+    logger.error('Graceful shutdown timed out, forcing exit');
+    process.exit(1);
+  }, config.shutdownTimeoutMs);
+  forceExit.unref();
+
+  try {
+    server?.close();
+    await queueRunner.stop();
+    shutdownSessions();
+    await webhookDispatcher.stop();
+    server?.closeAllConnections();
+    await pool.end();
+    logger.info('Shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    logger.error({ err: error }, 'Error during shutdown');
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 startServer();

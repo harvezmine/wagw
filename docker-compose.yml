@@ -24,6 +24,8 @@ services:
       dockerfile: Dockerfile
     container_name: whatsapp_gateway_api
     restart: unless-stopped
+    # Time for the graceful shutdown (finish the message being sent, flush webhooks)
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,6 +45,14 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ${DB_NAME:-whatsapp_gateway}
       GLOBAL_WEBHOOK_URL: ${GLOBAL_WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-10}
+      WEBHOOK_RETENTION_DAYS: ${WEBHOOK_RETENTION_DAYS:-7}
+      SEND_INTERVAL_MIN_MS: ${SEND_INTERVAL_MIN_MS:-2000}
+      SEND_INTERVAL_MAX_MS: ${SEND_INTERVAL_MAX_MS:-6000}
+      SEND_WAIT_TIMEOUT_MS: ${SEND_WAIT_TIMEOUT_MS:-60000}
+      QUEUE_MAX_AGE_HOURS: ${QUEUE_MAX_AGE_HOURS:-24}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       MIN_TYPING_DELAY_MS: ${MIN_TYPING_DELAY_MS:-1200}
       MAX_TYPING_DELAY_MS: ${MAX_TYPING_DELAY_MS:-3000}
       AUTO_READ_MESSAGES: ${AUTO_READ_MESSAGES:-true}
