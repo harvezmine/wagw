@@ -2,7 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseWaVersion, validateConfig } from '../src/config/index.js';
 
-const base = { nodeEnv: 'production', apiKey: 'a-very-long-api-key-123', defaultCountryCode: '62' };
+const base = {
+  nodeEnv: 'production',
+  apiKey: 'a-very-long-api-key-123',
+  defaultCountryCode: '62',
+  queue: { sendIntervalMinMs: 2000, sendIntervalMaxMs: 6000 },
+  webhook: { secret: '' }
+};
 
 test('validateConfig accepts a production config with a strong API key', () => {
   assert.doesNotThrow(() => validateConfig(base));
@@ -27,4 +33,13 @@ test('parseWaVersion parses a dotted version and rejects garbage', () => {
   assert.deepEqual(parseWaVersion('2.3000.1043857760'), [2, 3000, 1043857760]);
   assert.throws(() => parseWaVersion('2.3000'), /Invalid WA_VERSION/);
   assert.throws(() => parseWaVersion('2..3'), /Invalid WA_VERSION/);
+});
+
+test('validateConfig rejects an inverted send interval', () => {
+  assert.throws(() => validateConfig({ ...base, queue: { sendIntervalMinMs: 5000, sendIntervalMaxMs: 1000 } }), /SEND_INTERVAL/);
+});
+
+test('validateConfig rejects a short webhook secret', () => {
+  assert.throws(() => validateConfig({ ...base, webhook: { secret: 'short' } }), /WEBHOOK_SECRET/);
+  assert.doesNotThrow(() => validateConfig({ ...base, webhook: { secret: 'a-long-enough-secret-1' } }));
 });
