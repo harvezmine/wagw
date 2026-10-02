@@ -8,6 +8,15 @@ function parseBoolean(value, defaultValue) {
   return value === 'true';
 }
 
+/**
+ * Express "trust proxy" setting: unset/false, true, a hop count, or a list such as "loopback, 10.0.0.0/8".
+ */
+function parseTrustProxy(value) {
+  if (!value || value === 'false') return false;
+  if (value === 'true') return true;
+  return /^\d+$/.test(value) ? Number(value) : value;
+}
+
 function envInt(name, defaultValue) {
   return parseInt(process.env[name] || String(defaultValue), 10);
 }
@@ -33,6 +42,19 @@ export const config = {
   logPretty: parseBoolean(process.env.LOG_PRETTY, nodeEnv !== 'production'),
   baileysLogLevel: process.env.BAILEYS_LOG_LEVEL || 'error',
   shutdownTimeoutMs: envInt('SHUTDOWN_TIMEOUT_MS', 15000),
+  trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+  bulk: {
+    maxTargets: envInt('BULK_MAX_TARGETS', 500)
+  },
+  validate: {
+    maxNumbers: envInt('VALIDATE_MAX_NUMBERS', 50),
+    minIntervalMs: envInt('VALIDATE_MIN_INTERVAL_MS', 3000),
+    cacheTtlMs: envInt('VALIDATE_CACHE_DAYS', 7) * 24 * 60 * 60 * 1000
+  },
+  groups: {
+    cacheTtlMs: envInt('GROUPS_CACHE_MINUTES', 10) * 60 * 1000,
+    refreshMinIntervalMs: 60 * 1000
+  },
   queue: {
     sendIntervalMinMs: envInt('SEND_INTERVAL_MIN_MS', 2000),
     sendIntervalMaxMs: envInt('SEND_INTERVAL_MAX_MS', 6000),
