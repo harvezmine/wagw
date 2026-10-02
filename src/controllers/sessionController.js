@@ -10,6 +10,7 @@ import {
   setSessionWebhookConfig
 } from '../services/sessionManager.js';
 import { webhookOutbox } from '../services/webhookOutbox.js';
+import { validateNumbers } from '../services/numberService.js';
 import { webhookDispatcher } from '../services/webhookService.js';
 import { createQrLinkToken } from '../middlewares/auth.js';
 import { config } from '../config/index.js';
@@ -234,6 +235,18 @@ export async function retryWebhookDelivery(req, res) {
     }
     webhookDispatcher.wake();
     return res.status(200).json({ success: true, deliveryId, status: 'pending' });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function validateSessionNumbers(req, res) {
+  try {
+    const { numbers, countryCode } = req.body;
+    const result = await validateNumbers(req.params.sessionId, numbers, {
+      countryCode: countryCode === undefined || countryCode === '' ? undefined : String(countryCode)
+    });
+    return res.status(200).json({ success: true, ...result });
   } catch (error) {
     return sendError(res, error, 'SessionController');
   }

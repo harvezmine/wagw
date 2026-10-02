@@ -530,6 +530,14 @@ export async function requestPairingCode(sessionId, phoneNumber, { countryCode }
   return { code, phoneNumber: phone };
 }
 
+export function getConnectedSocket(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session || session.stopped || session.status !== 'connected') {
+    throw new AppError(409, `Session "${sessionId}" is not connected.`);
+  }
+  return session.sock;
+}
+
 export function isSessionConnected(sessionId) {
   const session = activeSessions.get(sessionId);
   return Boolean(session && !session.stopped && session.status === 'connected');
