@@ -1,5 +1,8 @@
 import { db as defaultDb } from '../database/db.js';
+import { AppError } from '../utils/errors.js';
 import { createKeyedLock } from '../utils/keyedLock.js';
+
+const DAY_MS = 24 * 3600 * 1000;
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -31,12 +34,29 @@ export function createNumberCheckStore(db = defaultDb) {
 
 /**
  * Checks whether phone numbers are on WhatsApp. Results are cached for `ttlMs`; uncached numbers are
- * looked up in batches, one session at a time and at most once per `minIntervalMs`, because bulk
- * contact discovery is itself a ban signal.
+ * looked up in batches, one session at a time and at most once per `minIntervalMs`, and at most
+ * `maxLookupsPerDay` numbers per session in any 24 hours, because bulk contact discovery is itself a
+ * ban signal.
  */
-export function createNumberChecker({ store, ttlMs, minIntervalMs, batchSize = 50, now = Date.now, sleep = defaultSleep }) {
+export function createNumberChecker({
+  store,
+  ttlMs,
+  minIntervalMs,
+  maxLookupsPerDay = Infinity,
+  batchSize = 50,
+  now = Date.now,
+  sleep = defaultSleep
+}) {
   const locks = createKeyedLock();
   const lastLookupAt = new Map();
+  // sessionId -> [{ at, count }] of lookups in the last 24 hours
+  const usage = new Map();
+
+  function lookupsToday(sessionId) {
+    const recent = (usage.get(sessionId) || []).filter((entry) => entry.at > now() - DAY_MS);
+    usage.set(sessionId, recent);
+    return recent.reduce((sum, entry) => sum + entry.count, 0);
+  }
 
   return {
     /**
@@ -49,6 +69,13 @@ export function createNumberChecker({ store, ttlMs, minIntervalMs, batchSize = 5
 
       if (missing.length) {
         await locks.run(sessionId, async () => {
+          if (lookupsToday(sessionId) + missing.length > maxLookupsPerDay) {
+            throw new AppError(
+              429,
+              `Daily number lookup limit reached (${maxLookupsPerDay} uncached numbers per 24 hours, VALIDATE_DAILY_LIMIT).`
+            );
+          }
+          usage.get(sessionId).push({ at: now(), count: missing.length });
           for (let index = 0; index < missing.length; index += batchSize) {
             const waitMs = (lastLookupAt.get(sessionId) ?? -Infinity) + minIntervalMs - now();
             if (waitMs > 0) await sleep(waitMs);

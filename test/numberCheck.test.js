@@ -61,3 +61,20 @@ test('throttles lookups per session and splits them into batches', async () => {
   assert.deepEqual(lookups, [2, 1]);
   assert.deepEqual(clock.sleeps, [3000]);
 });
+
+test('limits uncached lookups per session to a rolling daily budget; cached answers stay free', async () => {
+  const store = createFakeStore();
+  const clock = createClock();
+  const lookup = async () => [];
+  const checker = createNumberChecker({ store, ttlMs: 1e12, minIntervalMs: 0, maxLookupsPerDay: 3, now: clock.now, sleep: clock.sleep });
+
+  await checker.check('s1', ['62811', '62822'], lookup);
+  await assert.rejects(checker.check('s1', ['62833', '62844'], lookup), { status: 429, message: /Daily number lookup limit/ });
+  assert.equal((await checker.check('s1', ['62811', '62822'], lookup)).length, 2);
+  await checker.check('s1', ['62833'], lookup);
+  await assert.rejects(checker.check('s1', ['62855'], lookup), { status: 429 });
+  await checker.check('s2', ['62855'], lookup);
+
+  clock.sleep(24 * 3600 * 1000);
+  await checker.check('s1', ['62866', '62877', '62888'], lookup);
+});

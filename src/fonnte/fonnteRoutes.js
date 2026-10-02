@@ -11,6 +11,8 @@ import { assertSafeUrl } from '../utils/netGuard.js';
 import { phoneFromJid } from '../utils/jid.js';
 import { config } from '../config/index.js';
 import { parseCategory } from '../utils/validation.js';
+import { guardStore } from '../services/guardStore.js';
+import { pickStickySession } from '../services/routing.js';
 import { FonnteError, mapFonnteSend, parseFonnteData } from './fonnteParams.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.mediaMaxBytes } });
@@ -31,8 +33,8 @@ function fail(res, error) {
 }
 
 /**
- * Fonnte device tokens are tenant API keys bound to exactly one session. Several tokens separated by
- * commas rotate between their sessions.
+ * Fonnte device tokens are tenant API keys bound to exactly one session. With several tokens separated
+ * by commas, each recipient is routed to one of their sessions (see pickSession).
  */
 async function fonnteAuth(req, res, next) {
   try {
@@ -53,10 +55,17 @@ async function fonnteAuth(req, res, next) {
   }
 }
 
-function pickSession(sessionIds, mustBeConnected) {
-  const candidates = mustBeConnected ? sessionIds.filter(isSessionConnected) : sessionIds;
-  if (!candidates.length) throw new FonnteError('device disconnected');
-  return candidates[Math.floor(Math.random() * candidates.length)];
+/**
+ * With several device tokens, a recipient always gets the number that already talks to them; there is
+ * no failover to another number (a second number writing to the same person looks like evasion).
+ * New recipients are spread by a stable hash, so repeated sends keep using the same number.
+ */
+async function pickSession(sessionIds, targetJid, mustBeConnected) {
+  const conversations = sessionIds.length > 1 ? await guardStore.conversationsWith(sessionIds, targetJid) : new Map();
+  const candidates = conversations.size ? [...conversations.keys()] : sessionIds.filter((id) => !mustBeConnected || isSessionConnected(id));
+  const sessionId = pickStickySession(candidates, targetJid, conversations);
+  if (!sessionId || (mustBeConnected && !isSessionConnected(sessionId))) throw new FonnteError('device disconnected');
+  return sessionId;
 }
 
 router.post('/send', upload.single('file'), fonnteAuth, async (req, res) => {
@@ -68,7 +77,7 @@ router.post('/send', upload.single('file'), fonnteAuth, async (req, res) => {
     // Validate everything first so a bad item does not leave half the request queued
     for (const item of items) {
       try {
-        normalizeTarget(item.to, item.countryCode);
+        item.targetJid = normalizeTarget(item.to, item.countryCode);
       } catch {
         throw new FonnteError('target invalid');
       }
@@ -86,8 +95,8 @@ router.post('/send', upload.single('file'), fonnteAuth, async (req, res) => {
     const ids = [];
     const targets = [];
     let lastRefusal = null;
-    for (const item of items) {
-      const sessionId = pickSession(req.fonnte.sessionIds, item.connectOnly && !item.scheduleAt);
+    for (const { targetJid, ...item } of items) {
+      const sessionId = await pickSession(req.fonnte.sessionIds, targetJid, item.connectOnly && !item.scheduleAt);
       try {
         const { item: queued } = await submitMessage({ sessionId, ...item, category, wait: false });
         ids.push(String(queued.id));

@@ -7,7 +7,8 @@ import { getConnectedSocket } from './sessionManager.js';
 const checker = createNumberChecker({
   store: createNumberCheckStore(),
   ttlMs: config.validate.cacheTtlMs,
-  minIntervalMs: config.validate.minIntervalMs
+  minIntervalMs: config.validate.minIntervalMs,
+  maxLookupsPerDay: config.validate.dailyLimit
 });
 
 /**
