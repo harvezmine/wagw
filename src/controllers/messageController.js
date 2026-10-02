@@ -1,5 +1,7 @@
 import { requestPairingCode, downloadMediaByMessageId } from '../services/sessionManager.js';
-import { formatQueueItem, submitMessage } from '../services/messageService.js';
+import { formatQueueItem, submitBatch, submitMessage } from '../services/messageService.js';
+import { KEY_TYPES, parseMessageInput } from '../services/messageContent.js';
+import { isBulkTarget } from '../services/bulkTargets.js';
 import { query } from '../database/db.js';
 import { config } from '../config/index.js';
 import { AppError, sendError } from '../utils/errors.js';
@@ -49,6 +51,54 @@ function respondToSubmission(res, { item, result, duplicate }, extra = {}) {
   });
 }
 
+function parseMentions(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const list = Array.isArray(value) ? value : String(value).split(',');
+  if (list.length > 50) throw new AppError(400, 'At most 50 mentions per message.');
+  return list.map((entry) => String(entry).trim()).filter(Boolean);
+}
+
+/**
+ * POST /api/messages/send: every message type, one or many recipients.
+ */
+export async function sendMessage(req, res) {
+  try {
+    const { sessionId, to, replyTo } = req.body;
+    assertSessionId(sessionId);
+    const options = parseQueueOptions(req);
+    const { type, payload, media } = parseMessageInput(req.body, {
+      file: req.file,
+      countryCode: options.countryCode ?? config.defaultCountryCode
+    });
+    const mentions = parseMentions(req.body.mentions);
+
+    if (isBulkTarget(to)) {
+      if (replyTo) throw new AppError(400, 'replyTo cannot be combined with several recipients.');
+      const { wait, ...batchOptions } = options;
+      const results = await submitBatch({ sessionId, to, type, payload, media, mentions, ...batchOptions });
+      const queued = results.filter((result) => result.status === 'queued' || result.status === 'duplicate').length;
+      return res.status(queued ? 202 : 400).json({ success: queued > 0, total: results.length, queued, results });
+    }
+
+    if (!to && !KEY_TYPES.includes(type)) {
+      throw new AppError(400, 'to is required.');
+    }
+    const submission = await submitMessage({
+      sessionId,
+      to: Array.isArray(to) ? to[0] : to,
+      type,
+      payload,
+      media,
+      replyTo: replyTo ? String(replyTo) : null,
+      mentions,
+      ...options
+    });
+    return respondToSubmission(res, submission);
+  } catch (error) {
+    return sendError(res, error, 'MessageController');
+  }
+}
+
 export async function sendText(req, res) {
   try {
     const { sessionId, to, text } = req.body;
@@ -58,7 +108,7 @@ export async function sendText(req, res) {
     }
     assertSessionId(sessionId);
 
-    const submission = await submitMessage({ sessionId, to, type: 'text', content: { text }, ...parseQueueOptions(req) });
+    const submission = await submitMessage({ sessionId, to, type: 'text', payload: { text }, ...parseQueueOptions(req) });
     return respondToSubmission(res, submission);
   } catch (error) {
     return sendError(res, error, 'MessageController');
@@ -80,8 +130,8 @@ export async function sendImage(req, res) {
       sessionId,
       to,
       type: 'image',
-      content: { caption: caption || '' },
-      media: { input: imageInput },
+      payload: caption ? { caption } : {},
+      media: imageInput,
       ...parseQueueOptions(req)
     });
     return respondToSubmission(res, submission);
@@ -106,8 +156,8 @@ export async function sendAttachment(req, res) {
       sessionId,
       to,
       type: 'document',
-      content: { fileName: resolvedFileName, caption: caption || '', ...(resolvedMimetype ? { mimetype: resolvedMimetype } : {}) },
-      media: { input: docInput },
+      payload: { fileName: resolvedFileName, ...(caption ? { caption } : {}), ...(resolvedMimetype ? { mimetype: resolvedMimetype } : {}) },
+      media: docInput,
       ...parseQueueOptions(req)
     });
     return respondToSubmission(res, submission, { fileName: resolvedFileName });

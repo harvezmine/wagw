@@ -21,6 +21,7 @@ import { assertSafeUrl, fetchRemoteFile } from '../utils/netGuard.js';
 import { logger } from '../utils/logger.js';
 import { outboundQueue } from './outboundQueue.js';
 import { ackToStatus, allowedPreviousStatuses, describeAckError } from './messageStatus.js';
+import { MEDIA_TYPES, buildMessageContent, historyText, presenceFor } from './messageContent.js';
 
 // Map of active in-memory sessions (at most one socket per session)
 const activeSessions = new Map();
@@ -65,16 +66,19 @@ function describeSession(sessionData, message) {
 }
 
 /**
- * Anti-ban simulation: sends typing indicator for a natural duration before sending actual message
+ * Anti-ban simulation: shows typing (or recording) for a natural duration before sending. Actions
+ * such as reactions and deletions are sent without presence.
  */
-async function sendWithHumanSimulation(sock, jid, messageContent, customDelayMs = null) {
+async function sendWithHumanSimulation(sock, jid, messageContent, { delayMs = null, presence = 'composing', options = {} } = {}) {
+  if (!presence) {
+    return sock.sendMessage(jid, messageContent, options);
+  }
   try {
     // 1. Presence update - Typing / Recording
-    const isAudio = messageContent.audio || messageContent.voice;
-    await sock.sendPresenceUpdate(isAudio ? 'recording' : 'composing', jid);
+    await sock.sendPresenceUpdate(presence, jid);
 
     // 2. Calculate natural delay (an explicit delayMs, including 0, wins)
-    let delayTime = customDelayMs;
+    let delayTime = delayMs;
     if (delayTime === null || delayTime === undefined) {
       const textLen = (messageContent.text || messageContent.caption || '').length;
       const baseDelay = config.antiBan.minTypingDelayMs;
@@ -89,7 +93,7 @@ async function sendWithHumanSimulation(sock, jid, messageContent, customDelayMs 
     await sock.sendPresenceUpdate('paused', jid);
 
     // 4. Send the actual payload
-    return await sock.sendMessage(jid, messageContent);
+    return await sock.sendMessage(jid, messageContent, options);
   } catch (error) {
     try {
       await sock.sendPresenceUpdate('paused', jid);
@@ -552,11 +556,25 @@ async function saveOutgoingMessage(session, jid, result, { messageType, content,
   }
 }
 
+// Bulk sends reuse one media URL for many recipients: keep small downloads for a few minutes
+const remoteMediaCache = createTtlCache({ ttlMs: 10 * 60 * 1000, maxEntries: 10 });
+const CACHEABLE_MEDIA_BYTES = 10 * 1024 * 1024;
+
 async function loadQueuedMedia(item) {
   if (item.media_data) {
     return { buffer: item.media_data, contentType: item.payload.mimetype || null };
   }
-  return fetchRemoteFile(item.payload.url, { allowPrivate: config.allowPrivateUrls, maxBytes: config.mediaMaxBytes });
+  const cached = remoteMediaCache.get(item.payload.url);
+  if (cached) return cached;
+  const media = await fetchRemoteFile(item.payload.url, { allowPrivate: config.allowPrivateUrls, maxBytes: config.mediaMaxBytes });
+  if (media.buffer.length <= CACHEABLE_MEDIA_BYTES) remoteMediaCache.set(item.payload.url, media);
+  return media;
+}
+
+async function loadQuotedMessage(sessionId, messageId) {
+  const res = await query(`SELECT raw_payload FROM messages WHERE session_id = $1 AND message_id = $2`, [sessionId, messageId]);
+  const raw = res.rows[0]?.raw_payload;
+  return raw ? proto.WebMessageInfo.fromObject(raw) : undefined;
 }
 
 /**
@@ -568,40 +586,20 @@ export async function deliverQueuedMessage(item) {
   if (!session || session.stopped || session.status !== 'connected') {
     throw new AppError(503, `Session "${item.session_id}" is not connected.`);
   }
-
+  const type = item.message_type;
   const { payload } = item;
-  let content;
-  let historyContent;
-  switch (item.message_type) {
-    case 'text':
-      content = { text: payload.text };
-      historyContent = payload.text;
-      break;
-    case 'image': {
-      const media = await loadQueuedMedia(item);
-      content = { image: media.buffer, caption: payload.caption || '' };
-      historyContent = payload.caption || '';
-      break;
-    }
-    case 'document': {
-      const media = await loadQueuedMedia(item);
-      content = {
-        document: media.buffer,
-        fileName: payload.fileName || 'file',
-        mimetype: payload.mimetype || media.contentType || 'application/octet-stream',
-        caption: payload.caption || ''
-      };
-      historyContent = payload.caption || payload.fileName || 'file';
-      break;
-    }
-    default:
-      throw new AppError(400, `Unsupported message type "${item.message_type}".`);
-  }
+  const media = MEDIA_TYPES.includes(type) ? await loadQueuedMedia(item) : null;
+  const content = buildMessageContent(type, payload, { media, key: payload.key || null });
+  const quoted = payload.replyTo ? await loadQuotedMessage(item.session_id, payload.replyTo) : undefined;
 
-  const result = await sendWithHumanSimulation(session.sock, item.target_jid, content, payload.delayMs);
+  const result = await sendWithHumanSimulation(session.sock, item.target_jid, content, {
+    delayMs: payload.delayMs,
+    presence: presenceFor(type),
+    options: quoted ? { quoted } : {}
+  });
   await saveOutgoingMessage(session, item.target_jid, result, {
-    messageType: item.message_type,
-    content: historyContent,
+    messageType: type,
+    content: historyText(type, payload),
     mediaUrl: payload.url || null
   });
   return result.key.id;

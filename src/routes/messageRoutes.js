@@ -1,6 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import {
+  sendMessage,
   sendText,
   sendImage,
   sendAttachment,
@@ -19,6 +20,7 @@ const router = express.Router();
 
 router.param('sessionId', validateSessionIdParam);
 
+router.post('/send', upload.single('file'), sendMessage);
 router.post('/send-text', sendText);
 router.post('/send-image', upload.single('file'), sendImage);
 router.post('/send-attachment', upload.single('file'), sendAttachment);
