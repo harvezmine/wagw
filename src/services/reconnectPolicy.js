@@ -5,7 +5,11 @@ const STOP_REASONS = new Map([
   [DisconnectReason.forbidden, 'forbidden'],
   [DisconnectReason.connectionReplaced, 'connection_replaced'],
   [DisconnectReason.multideviceMismatch, 'multidevice_mismatch'],
-  [405, 'client_version_rejected']
+  [405, 'client_version_rejected'],
+  // Bans: reconnecting while banned only adds to the account's record
+  [402, 'temporarily_banned'],
+  [406, 'banned'],
+  [409, 'client_rejected']
 ]);
 
 /**

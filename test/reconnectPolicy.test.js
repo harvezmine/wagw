@@ -9,7 +9,15 @@ test('logged out sessions are cleared', () => {
 });
 
 test('conflict, ban, device mismatch and rejected client version stop without reconnecting', () => {
-  const reasons = { 440: 'connection_replaced', 403: 'forbidden', 411: 'multidevice_mismatch', 405: 'client_version_rejected' };
+  const reasons = {
+    440: 'connection_replaced',
+    403: 'forbidden',
+    411: 'multidevice_mismatch',
+    405: 'client_version_rejected',
+    402: 'temporarily_banned',
+    406: 'banned',
+    409: 'client_rejected'
+  };
   for (const [code, reason] of Object.entries(reasons)) {
     assert.deepEqual(decideReconnect({ ...opts, statusCode: Number(code) }), { action: 'stop', reason });
   }
