@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertSessionId, parseIdempotencyKey, parseOptionalBool, parseOptionalInt, parseScheduleAt } from '../src/utils/validation.js';
+import { assertSessionId, parseCategory, parseIdempotencyKey, parseOptionalBool, parseOptionalInt, parseScheduleAt } from '../src/utils/validation.js';
 
 test('assertSessionId accepts letters, digits, dot, underscore and dash', () => {
   assert.equal(assertSessionId('sales-01'), 'sales-01');
@@ -57,4 +57,11 @@ test('parseIdempotencyKey accepts short visible keys', () => {
   assert.equal(parseIdempotencyKey('order-123'), 'order-123');
   assert.throws(() => parseIdempotencyKey('has space'), { status: 400 });
   assert.throws(() => parseIdempotencyKey('x'.repeat(201)), { status: 400 });
+});
+
+test('parseCategory accepts the three message categories and leaves the default to the caller', () => {
+  for (const category of ['transactional', 'campaign', 'reply']) assert.equal(parseCategory(category), category);
+  assert.equal(parseCategory(undefined), undefined);
+  assert.equal(parseCategory(''), undefined);
+  assert.throws(() => parseCategory('marketing'), { status: 400 });
 });

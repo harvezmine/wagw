@@ -67,3 +67,17 @@ export function parseIdempotencyKey(value) {
   }
   return key;
 }
+
+// transactional: default for single sends; campaign: default for bulk; reply: answer in an active conversation
+export const MESSAGE_CATEGORIES = ['transactional', 'campaign', 'reply'];
+
+/**
+ * Message category, or undefined when not given (the caller picks the default).
+ */
+export function parseCategory(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (!MESSAGE_CATEGORIES.includes(value)) {
+    throw new AppError(400, `category must be one of: ${MESSAGE_CATEGORIES.join(', ')}.`);
+  }
+  return value;
+}

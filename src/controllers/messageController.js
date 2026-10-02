@@ -8,6 +8,7 @@ import { config } from '../config/index.js';
 import { AppError, sendError } from '../utils/errors.js';
 import {
   assertSessionId,
+  parseCategory,
   parseIdempotencyKey,
   parseOptionalBool,
   parseOptionalInt,
@@ -22,13 +23,16 @@ function parseQueueOptions(req) {
     scheduleAt: parseScheduleAt(body.scheduleAt),
     idempotencyKey: parseIdempotencyKey(body.idempotencyKey ?? req.get('idempotency-key')),
     connectOnly: parseOptionalBool(body.connectOnly, { name: 'connectOnly', defaultValue: true }),
+    // Default: transactional for one recipient, campaign for several
+    category: parseCategory(body.category),
     wait: !parseOptionalBool(body.async, { name: 'async', defaultValue: false })
   };
 }
 
 /**
- * 200 when the message was sent within SEND_WAIT_TIMEOUT_MS; 202 while it is queued or scheduled;
- * the failure status (4xx for bad input, 502 otherwise) when sending failed.
+ * 200 when the message was sent within SEND_WAIT_TIMEOUT_MS; 202 while it is queued, scheduled or held
+ * back by the send guard; 409 when the guard skipped it; the failure status (4xx for bad input,
+ * 502 otherwise) when sending failed.
  */
 function respondToSubmission(res, { item, result, duplicate }, extra = {}) {
   const queued = formatQueueItem(item);
@@ -42,12 +46,16 @@ function respondToSubmission(res, { item, result, duplicate }, extra = {}) {
     const status = result.httpStatus >= 400 && result.httpStatus < 500 ? result.httpStatus : 502;
     return res.status(status).json({ success: false, status: 'failed', error: result.error, queueId: queued.queueId });
   }
+  if (result?.status === 'skipped') {
+    return res.status(409).json({ success: false, status: 'skipped', error: `Not sent: ${result.error}.`, queueId: queued.queueId });
+  }
   return res.status(202).json({
     success: true,
     status: result?.status ?? queued.status,
     queueId: queued.queueId,
     remoteJid: queued.to,
     scheduledAt: queued.scheduledAt,
+    ...(result?.deferredUntil ? { deferredUntil: result.deferredUntil, reason: result.reason } : {}),
     message: 'Message accepted. Track it with GET /api/queue/:queueId or the message.status webhook.'
   });
 }

@@ -9,7 +9,38 @@ import { createQueueRunner } from './queueRunner.js';
 import { parseTargets, renderTemplate } from './bulkTargets.js';
 import { KEY_TYPES } from './messageContent.js';
 import { sendWebhookEvent } from './webhookService.js';
-import { deliverQueuedMessage, getConnectedSessionIds, isSessionConnected } from './sessionManager.js';
+import { createSendGate } from './sendGate.js';
+import { guardStore } from './guardStore.js';
+import { consentBlockReason } from './consent.js';
+import { isRegistered } from './numberService.js';
+import { parseTimeWindow } from '../utils/timeWindow.js';
+import {
+  deliverQueuedMessage,
+  getConnectedSessionIds,
+  getSessionSettings,
+  getSessionState,
+  isSessionConnected
+} from './sessionManager.js';
+
+const log = logger.child({ module: 'queue' });
+
+export const sendGate = createSendGate({
+  store: guardStore,
+  getSessionState,
+  // Unknown (lookup failed) never blocks a send
+  checkRegistered: (sessionId, jid) =>
+    isRegistered(sessionId, jid).catch((error) => {
+      log.warn({ sessionId, err: error.message }, 'Number lookup for a new chat failed');
+      return null;
+    }),
+  rules: {
+    ...config.guard,
+    // Parsed on use: validateConfig reports a malformed CAMPAIGN_HOURS at startup
+    get campaignWindow() {
+      return parseTimeWindow(config.guard.campaignHours);
+    }
+  }
+});
 
 export const queueRunner = createQueueRunner({
   queue: outboundQueue,
@@ -21,7 +52,8 @@ export const queueRunner = createQueueRunner({
   maxAttempts: config.queue.maxAttempts,
   retryDelayMs: config.queue.retryDelayMs,
   maxAgeMs: config.queue.maxAgeMs,
-  // sent / failed / expired; delivered and read follow from WhatsApp receipts
+  gate: sendGate,
+  // sent / failed / expired / skipped; delivered and read follow from WhatsApp receipts
   onResult: ({ id, sessionId, to, status, messageId = null, error = null }) => {
     sendWebhookEvent(sessionId, 'message.status', {
       messageId,
@@ -32,7 +64,7 @@ export const queueRunner = createQueueRunner({
       timestamp: new Date().toISOString()
     });
   },
-  logger: logger.child({ module: 'queue' })
+  logger: log
 });
 
 export function formatQueueItem(row) {
@@ -41,9 +73,12 @@ export function formatQueueItem(row) {
     sessionId: row.session_id,
     to: row.target_jid,
     type: row.message_type,
+    category: row.category,
     content: row.payload,
     status: row.status,
     scheduledAt: row.scheduled_at,
+    deferredUntil: row.deferred_until ?? null,
+    newContact: row.new_contact ?? null,
     attempts: row.attempts,
     messageId: row.message_id,
     error: row.last_error,
@@ -141,6 +176,25 @@ async function prepareSubmission({ sessionId, countryCode, type, payload, media,
   return prepared;
 }
 
+const isPersonalJid = (jid) => jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid');
+
+/**
+ * Consent problems known before queueing (opt-outs, campaigns without consent): target JID -> reason.
+ * The send gate checks again right before sending.
+ */
+async function consentBlocks(sessionId, targetJids, category) {
+  const personal = targetJids.filter(isPersonalJid);
+  if (!personal.length) return new Map();
+  const [contacts, settings] = await Promise.all([guardStore.getContacts(sessionId, personal), getSessionSettings(sessionId)]);
+  const requireConsent = settings.campaignConsentRequired ?? config.guard.campaignRequireConsent;
+  const blocked = new Map();
+  for (const jid of personal) {
+    const reason = consentBlockReason({ category, isGroup: false, contact: contacts.get(jid), requireConsent });
+    if (reason) blocked.set(jid, reason);
+  }
+  return blocked;
+}
+
 /**
  * Validates and queues one outgoing message. With `wait` (and a connected session), resolves once it
  * was sent or failed, or after SEND_WAIT_TIMEOUT_MS while it is still queued.
@@ -158,12 +212,17 @@ export async function submitMessage({
   scheduleAt = null,
   idempotencyKey = null,
   connectOnly = true,
-  wait = true
+  wait = true,
+  category = 'transactional'
 }) {
   const isKeyType = KEY_TYPES.includes(type);
   const targetJid = isKeyType ? null : normalizeTarget(to, countryCode ?? config.defaultCountryCode);
   await assertSessionExists(sessionId);
   assertCanQueue(sessionId, { connectOnly, scheduleAt });
+  if (!isKeyType) {
+    const reason = (await consentBlocks(sessionId, [targetJid], category)).get(targetJid);
+    if (reason) throw new AppError(409, `Not sent: ${reason}.`, 'not_sent');
+  }
   const prepared = await prepareSubmission({ sessionId, countryCode, type, payload, media, replyTo, mentions, delayMs });
 
   const { item, created } = await outboundQueue.enqueue({
@@ -171,6 +230,7 @@ export async function submitMessage({
     idempotencyKey,
     targetJid: prepared.targetJid ?? targetJid,
     messageType: type,
+    category,
     payload: prepared.payload,
     mediaData: prepared.mediaData,
     scheduledAt: scheduleAt
@@ -201,7 +261,8 @@ export async function submitBatch({
   delayMs,
   scheduleAt = null,
   idempotencyKey = null,
-  connectOnly = true
+  connectOnly = true,
+  category = 'campaign'
 }) {
   if (KEY_TYPES.includes(type)) {
     throw new AppError(400, `${type} messages target one existing message and cannot be sent in bulk.`);
@@ -219,14 +280,22 @@ export async function submitBatch({
   const shared = await prepareSubmission({ sessionId, countryCode, type, payload, media, mentions, delayMs });
 
   const code = countryCode ?? config.defaultCountryCode;
+  const jids = new Map();
+  for (const target of targets) {
+    try {
+      jids.set(target, normalizeTarget(target.number, code));
+    } catch (error) {
+      jids.set(target, error);
+    }
+  }
+  const blocked = await consentBlocks(sessionId, [...new Set([...jids.values()].filter((jid) => typeof jid === 'string'))], category);
+
   const seen = new Set();
   const results = [];
   for (const target of targets) {
-    let targetJid;
-    try {
-      targetJid = normalizeTarget(target.number, code);
-    } catch (error) {
-      results.push({ to: target.number, status: 'invalid', error: error.message });
+    const targetJid = jids.get(target);
+    if (targetJid instanceof Error) {
+      results.push({ to: target.number, status: 'invalid', error: targetJid.message });
       continue;
     }
     if (seen.has(targetJid)) {
@@ -234,6 +303,10 @@ export async function submitBatch({
       continue;
     }
     seen.add(targetJid);
+    if (blocked.has(targetJid)) {
+      results.push({ to: targetJid, status: 'skipped', error: `Not sent: ${blocked.get(targetJid)}.` });
+      continue;
+    }
 
     const personalized = { ...shared.payload };
     for (const field of ['text', 'caption']) {
@@ -246,6 +319,7 @@ export async function submitBatch({
       idempotencyKey: idempotencyKey ? `${idempotencyKey}:${targetJid}` : null,
       targetJid,
       messageType: type,
+      category,
       payload: personalized,
       mediaData: null,
       scheduledAt: scheduleAt

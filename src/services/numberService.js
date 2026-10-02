@@ -11,6 +11,15 @@ const checker = createNumberChecker({
 });
 
 /**
+ * Whether one personal JID is on WhatsApp (cached), for the send gate. Throws when it cannot tell.
+ */
+export async function isRegistered(sessionId, jid) {
+  const phone = jid.split('@')[0];
+  const [result] = await checker.check(sessionId, [phone], (jids) => getConnectedSocket(sessionId).onWhatsApp(...jids));
+  return result.exists;
+}
+
+/**
  * Which numbers are registered on WhatsApp. Cached answers do not need a connected session.
  */
 export async function validateNumbers(sessionId, numbers, { countryCode } = {}) {

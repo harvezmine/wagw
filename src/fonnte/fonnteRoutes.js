@@ -10,6 +10,7 @@ import { normalizeTarget } from '../utils/phone.js';
 import { assertSafeUrl } from '../utils/netGuard.js';
 import { phoneFromJid } from '../utils/jid.js';
 import { config } from '../config/index.js';
+import { parseCategory } from '../utils/validation.js';
 import { FonnteError, mapFonnteSend, parseFonnteData } from './fonnteParams.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.mediaMaxBytes } });
@@ -21,6 +22,7 @@ const router = express.Router();
 function fail(res, error) {
   if (error instanceof FonnteError) return res.json({ status: false, reason: error.message });
   if (error instanceof AppError) {
+    if (error.code === 'not_sent') return res.json({ status: false, reason: error.message });
     if (error.status === 409) return res.json({ status: false, reason: 'device disconnected' });
     if (error.status < 500) return res.json({ status: false, reason: error.message });
   }
@@ -79,14 +81,24 @@ router.post('/send', upload.single('file'), fonnteAuth, async (req, res) => {
       }
     }
 
+    // Several recipients are a campaign (consent, campaign hours); `category` overrides
+    const category = parseCategory(req.body.category) ?? (items.length > 1 ? 'campaign' : 'transactional');
     const ids = [];
     const targets = [];
+    let lastRefusal = null;
     for (const item of items) {
       const sessionId = pickSession(req.fonnte.sessionIds, item.connectOnly && !item.scheduleAt);
-      const { item: queued } = await submitMessage({ sessionId, ...item, wait: false });
-      ids.push(String(queued.id));
-      targets.push(phoneFromJid(queued.target_jid));
+      try {
+        const { item: queued } = await submitMessage({ sessionId, ...item, category, wait: false });
+        ids.push(String(queued.id));
+        targets.push(phoneFromJid(queued.target_jid));
+      } catch (error) {
+        // One opted-out recipient does not fail a multi-target request
+        if (!(error instanceof AppError && error.code === 'not_sent' && items.length > 1)) throw error;
+        lastRefusal = error;
+      }
     }
+    if (!ids.length) throw lastRefusal;
     const scheduled = items.some((item) => item.scheduleAt);
     return res.json({
       detail: scheduled ? 'success! message will be sent on scheduled time' : 'success! message in queue',
