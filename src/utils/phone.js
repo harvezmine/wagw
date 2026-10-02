@@ -4,8 +4,7 @@ const JID_PATTERNS = [
   ['@s.whatsapp.net', /^\d{8,15}$/],
   ['@g.us', /^\d+(-\d+)?$/],
   ['@lid', /^\d+$/],
-  ['@newsletter', /^\d+$/],
-  ['@broadcast', /^(status|\d+)$/]
+  ['@newsletter', /^\d+$/]
 ];
 
 /**

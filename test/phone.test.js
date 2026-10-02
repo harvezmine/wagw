@@ -35,7 +35,7 @@ test('normalizeTarget passes through valid JIDs', () => {
 });
 
 test('normalizeTarget rejects malformed JIDs and empty targets', () => {
-  for (const value of ['abc@s.whatsapp.net', 'foo@example.com', '', '<script>@g.us']) {
+  for (const value of ['abc@s.whatsapp.net', 'foo@example.com', '', '<script>@g.us', 'status@broadcast', '12345@broadcast']) {
     assert.throws(() => normalizeTarget(value, '62'), { status: 400 });
   }
 });
