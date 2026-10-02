@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "LOG_LEVEL=silent LOG_PRETTY=false node --test test/*.test.js"
   },
   "keywords": [
     "whatsapp",

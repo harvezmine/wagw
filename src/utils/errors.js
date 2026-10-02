@@ -1,3 +1,5 @@
+import { logger } from './logger.js';
+
 /**
  * Error with an HTTP status code. Anything else that reaches a controller is treated as a 500.
  */
@@ -12,7 +14,7 @@ export class AppError extends Error {
 export function sendError(res, error, context) {
   const status = error instanceof AppError ? error.status : 500;
   if (status >= 500) {
-    console.error(`[${context}]`, error);
+    logger.error({ err: error, context }, 'Request failed');
   }
   return res.status(status).json({ success: false, error: error.message });
 }

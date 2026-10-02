@@ -1,6 +1,7 @@
 import pkg from 'pg';
 const { Pool } = pkg;
 import { config } from '../config/index.js';
+import { logger } from '../utils/logger.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -45,7 +46,7 @@ export const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('[PostgreSQL] Unexpected error on idle client:', err);
+  logger.error({ err }, 'Unexpected error on idle PostgreSQL client');
 });
 
 export const db = createDb(pool);
@@ -66,9 +67,9 @@ export async function initDatabase() {
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS disconnect_reason VARCHAR(100);
     `);
 
-    console.log('[PostgreSQL] Database tables initialized and verified successfully.');
+    logger.info('Database tables initialized and verified');
   } catch (error) {
-    console.error('[PostgreSQL] Failed to initialize database tables:', error.message);
+    logger.error({ err: error }, 'Failed to initialize database tables');
     throw error;
   }
 }

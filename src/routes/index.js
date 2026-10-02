@@ -3,6 +3,7 @@ import sessionRoutes from './sessionRoutes.js';
 import messageRoutes from './messageRoutes.js';
 import { apiKeyAuth } from '../middlewares/auth.js';
 import { config } from '../config/index.js';
+import { logger } from '../utils/logger.js';
 
 const router = express.Router();
 
@@ -18,10 +19,7 @@ router.get('/health', (req, res) => {
 // Unauthenticated test webhook receiver for local debugging only
 if (config.nodeEnv !== 'production') {
   router.post('/webhook-test', (req, res) => {
-    console.log('----------------------------------------------------');
-    console.log('[Webhook Test Receiver] Received Payload:');
-    console.log(JSON.stringify(req.body, null, 2));
-    console.log('----------------------------------------------------');
+    logger.info({ payload: req.body }, 'Webhook test receiver got a payload');
     res.status(200).json({ received: true });
   });
 }

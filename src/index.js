@@ -4,6 +4,7 @@ import { config, validateConfig } from './config/index.js';
 import { initDatabase } from './database/db.js';
 import { restoreSessions } from './services/sessionManager.js';
 import apiRoutes from './routes/index.js';
+import { logger } from './utils/logger.js';
 
 const app = express();
 
@@ -17,7 +18,7 @@ app.use((req, res, next) => {
   res.on('finish', () => {
     // Path only: query strings may carry signed QR link tokens
     const path = req.originalUrl.split('?')[0];
-    console.log(`[HTTP] ${req.method} ${path} -> ${res.statusCode} (${Date.now() - start}ms)`);
+    logger.info({ method: req.method, path, status: res.statusCode, durationMs: Date.now() - start }, 'HTTP request');
   });
   next();
 });
@@ -235,7 +236,7 @@ app.get('/', (req, res) => {
 app.use((err, req, res, next) => {
   const status = err.status || err.statusCode || 500;
   if (status >= 500) {
-    console.error('[App Error]', err);
+    logger.error({ err }, 'Unhandled request error');
   }
   res.status(status).json({
     success: false,
@@ -245,7 +246,7 @@ app.use((err, req, res, next) => {
 
 // Last line of defence: log stray promise rejections instead of letting Node kill every session
 process.on('unhandledRejection', (reason) => {
-  console.error('[Process] Unhandled promise rejection:', reason);
+  logger.error({ err: reason }, 'Unhandled promise rejection');
 });
 
 // Start Server
@@ -253,23 +254,20 @@ async function startServer() {
   try {
     validateConfig();
     if (!config.apiKey) {
-      console.warn('[Security] API_KEY is not set: the API is unauthenticated. Only acceptable for local development.');
+      logger.warn('API_KEY is not set: the API is unauthenticated. Only acceptable for local development.');
     }
 
-    console.log('[Server] Connecting to PostgreSQL...');
+    logger.info('Connecting to PostgreSQL');
     await initDatabase();
 
-    console.log('[Server] Restoring previously active WhatsApp sessions...');
+    logger.info('Restoring previously active WhatsApp sessions');
     await restoreSessions();
 
     app.listen(config.port, config.host, () => {
-      console.log(`====================================================`);
-      console.log(`🚀 WhatsApp Web Gateway is running on http://${config.host}:${config.port}`);
-      console.log(`📖 API Documentation UI: http://localhost:${config.port}/`);
-      console.log(`====================================================`);
+      logger.info({ url: `http://${config.host}:${config.port}`, docs: `http://localhost:${config.port}/` }, 'WhatsApp Web Gateway is running');
     });
   } catch (error) {
-    console.error('[Server] Fatal startup error:', error.message);
+    logger.fatal({ err: error }, `Fatal startup error: ${error.message}`);
     process.exit(1);
   }
 }

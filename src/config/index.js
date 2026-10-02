@@ -1,6 +1,8 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+const nodeEnv = process.env.NODE_ENV || 'development';
+
 function parseBoolean(value, defaultValue) {
   if (value === undefined || value === '') return defaultValue;
   return value === 'true';
@@ -21,8 +23,11 @@ export function parseWaVersion(value) {
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   host: process.env.HOST || '0.0.0.0',
-  nodeEnv: process.env.NODE_ENV || 'development',
+  nodeEnv,
   apiKey: process.env.API_KEY || '',
+  logLevel: process.env.LOG_LEVEL || 'info',
+  logPretty: parseBoolean(process.env.LOG_PRETTY, nodeEnv !== 'production'),
+  baileysLogLevel: process.env.BAILEYS_LOG_LEVEL || 'error',
   qrLinkTtlSeconds: parseInt(process.env.QR_LINK_TTL_SECONDS || '600', 10),
   defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || '62',
   allowPrivateUrls: parseBoolean(process.env.ALLOW_PRIVATE_URLS, false),
