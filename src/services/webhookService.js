@@ -5,7 +5,9 @@ import { logger } from '../utils/logger.js';
 import { createWebhookConfigResolver } from './webhookConfigResolver.js';
 import { webhookOutbox } from './webhookOutbox.js';
 import { createWebhookDispatcher, createWebhookPoster } from './webhookDispatcher.js';
+import { toFonnteWebhook } from '../fonnte/fonnteWebhook.js';
 
+export const WEBHOOK_FORMATS = ['default', 'fonnte'];
 export const WEBHOOK_EVENTS = ['connection.update', 'message.received', 'message.status', 'account.restriction', 'call.received'];
 
 const log = logger.child({ module: 'webhook' });
@@ -203,11 +205,11 @@ export async function sendWebhookEvent(sessionId, eventType, payload) {
     if (!target.url || (target.events && !target.events.includes(eventType))) {
       return;
     }
-    await webhookOutbox.enqueue({
-      sessionId,
-      eventType,
-      payload: { event: eventType, sessionId, timestamp: new Date().toISOString(), data: payload }
-    });
+    const body = target.format === 'fonnte'
+      ? toFonnteWebhook(eventType, payload, { device: target.phone })
+      : { event: eventType, sessionId, timestamp: new Date().toISOString(), data: payload };
+    if (!body) return;
+    await webhookOutbox.enqueue({ sessionId, eventType, payload: body });
     webhookDispatcher.wake();
   } catch (error) {
     log.error({ sessionId, event: eventType, err: error }, 'Failed to queue webhook event');

@@ -183,8 +183,8 @@ export async function listSessions(req, res) {
 export async function updateWebhook(req, res) {
   try {
     const { sessionId } = req.params;
-    const { webhookUrl, webhookSecret, events } = req.body;
-    const webhook = await setSessionWebhookConfig(sessionId, { webhookUrl, webhookSecret, events });
+    const { webhookUrl, webhookSecret, events, format } = req.body;
+    const webhook = await setSessionWebhookConfig(sessionId, { webhookUrl, webhookSecret, events, format });
 
     return res.status(200).json({
       success: true,

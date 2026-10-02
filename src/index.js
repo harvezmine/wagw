@@ -4,6 +4,7 @@ import { config, validateConfig } from './config/index.js';
 import { initDatabase, pool } from './database/db.js';
 import { restoreSessions, shutdownSessions } from './services/sessionManager.js';
 import apiRoutes from './routes/index.js';
+import fonnteRoutes from './fonnte/fonnteRoutes.js';
 import { logger } from './utils/logger.js';
 import { outboundQueue } from './services/outboundQueue.js';
 import { queueRunner } from './services/messageService.js';
@@ -32,6 +33,8 @@ app.use((req, res, next) => {
 
 // Mount API Routes
 app.use('/api', apiRoutes);
+// Fonnte-compatible endpoints (drop-in for clients built for api.fonnte.com)
+app.use('/fonnte', fonnteRoutes);
 
 // Landing / Documentation Page
 app.get('/', (req, res) => {

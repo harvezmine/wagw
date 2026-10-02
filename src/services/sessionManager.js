@@ -9,7 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import { query } from '../database/db.js';
 import { clearAuthState, usePostgresAuthState } from '../database/postgresAuthState.js';
-import { WEBHOOK_EVENTS, extractMessageData, invalidateWebhookConfig, sendWebhookEvent } from './webhookService.js';
+import { WEBHOOK_EVENTS, WEBHOOK_FORMATS, extractMessageData, invalidateWebhookConfig, sendWebhookEvent } from './webhookService.js';
 import { backoffDelay, decideReconnect } from './reconnectPolicy.js';
 import { config } from '../config/index.js';
 import { AppError } from '../utils/errors.js';
@@ -184,6 +184,8 @@ async function handleOpen(sessionData) {
   );
 
   log.info({ sessionId, phone }, 'Connected');
+  // The cached webhook settings carry the phone number used in Fonnte-style payloads
+  invalidateWebhookConfig(sessionId);
 
   sendWebhookEvent(sessionId, 'connection.update', {
     status: 'connected',
@@ -780,6 +782,7 @@ export async function getSessionStatus(sessionId) {
     webhookUrl: row.webhook_url,
     webhookSecretSet: Boolean(row.webhook_secret),
     webhookEvents: row.webhook_events,
+    webhookFormat: row.webhook_format,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -805,7 +808,7 @@ export async function getAllSessions() {
 /**
  * Updates the webhook settings of a session. Absent fields stay unchanged; null or "" clears a value.
  */
-export async function setSessionWebhookConfig(sessionId, { webhookUrl, webhookSecret, events }) {
+export async function setSessionWebhookConfig(sessionId, { webhookUrl, webhookSecret, events, format }) {
   const assignments = [];
   const params = [sessionId];
   const assign = (column, value) => {
@@ -831,10 +834,16 @@ export async function setSessionWebhookConfig(sessionId, { webhookUrl, webhookSe
     }
     assign('webhook_events', events);
   }
+  if (format !== undefined) {
+    if (!WEBHOOK_FORMATS.includes(format)) {
+      throw new AppError(400, `format must be one of: ${WEBHOOK_FORMATS.join(', ')}.`);
+    }
+    assign('webhook_format', format);
+  }
 
   const res = await query(
     `UPDATE sessions SET ${[...assignments, 'updated_at = NOW()'].join(', ')} WHERE id = $1
-     RETURNING webhook_url, webhook_secret IS NOT NULL AS webhook_secret_set, webhook_events`,
+     RETURNING webhook_url, webhook_secret IS NOT NULL AS webhook_secret_set, webhook_events, webhook_format`,
     params
   );
   if (res.rowCount === 0) {
@@ -842,7 +851,7 @@ export async function setSessionWebhookConfig(sessionId, { webhookUrl, webhookSe
   }
   invalidateWebhookConfig(sessionId);
   const row = res.rows[0];
-  return { webhookUrl: row.webhook_url, webhookSecretSet: row.webhook_secret_set, events: row.webhook_events };
+  return { webhookUrl: row.webhook_url, webhookSecretSet: row.webhook_secret_set, events: row.webhook_events, format: row.webhook_format };
 }
 
 /**

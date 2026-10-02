@@ -15,13 +15,21 @@ const GLOBALS = { globalWebhookUrl: 'https://global.example.com', globalSecret: 
 
 test('returns the session webhook settings and caches them', async () => {
   const { query, calls } = fakeQuery({
-    s1: { webhook_url: 'https://hooks.example.com/s1', webhook_secret: 'session-secret-123456', webhook_events: ['message.received'] }
+    s1: {
+      webhook_url: 'https://hooks.example.com/s1',
+      webhook_secret: 'session-secret-123456',
+      webhook_events: ['message.received'],
+      webhook_format: 'fonnte',
+      phone_number: '62811'
+    }
   });
   const resolver = createWebhookConfigResolver({ query, ...GLOBALS });
   assert.deepEqual(await resolver.resolve('s1'), {
     url: 'https://hooks.example.com/s1',
     secret: 'session-secret-123456',
-    events: ['message.received']
+    events: ['message.received'],
+    format: 'fonnte',
+    phone: '62811'
   });
   await resolver.resolve('s1');
   assert.deepEqual(calls, ['s1']);
@@ -30,7 +38,7 @@ test('returns the session webhook settings and caches them', async () => {
 test('uses the global URL with the global secret when the session has no URL', async () => {
   const { query } = fakeQuery({ s1: { webhook_url: null, webhook_secret: 'session-secret-123456', webhook_events: null } });
   const resolver = createWebhookConfigResolver({ query, ...GLOBALS });
-  const expected = { url: 'https://global.example.com', secret: 'global-secret-123456', events: null };
+  const expected = { url: 'https://global.example.com', secret: 'global-secret-123456', events: null, format: 'default', phone: null };
   assert.deepEqual(await resolver.resolve('s1'), expected);
   assert.deepEqual(await resolver.resolve('missing'), expected);
 });
