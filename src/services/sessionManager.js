@@ -6,17 +6,19 @@ import makeWASocket, {
   proto
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
-import pino from 'pino';
 import { query } from '../database/db.js';
 import { clearAuthState, usePostgresAuthState } from '../database/postgresAuthState.js';
 import { extractMessageData, invalidateWebhookUrl, sendWebhookEvent } from './webhookService.js';
 import { backoffDelay, decideReconnect } from './reconnectPolicy.js';
 import { config } from '../config/index.js';
 import { AppError } from '../utils/errors.js';
-import { normalizePhoneNumber, normalizeTarget } from '../utils/phone.js';
+import { normalizePhoneNumber } from '../utils/phone.js';
 import { createKeyedLock } from '../utils/keyedLock.js';
 import { createTtlCache } from '../utils/ttlCache.js';
 import { assertSafeUrl, fetchRemoteFile } from '../utils/netGuard.js';
+import { logger } from '../utils/logger.js';
+import { outboundQueue } from './outboundQueue.js';
+import { ackToStatus, allowedPreviousStatuses, describeAckError } from './messageStatus.js';
 
 // Map of active in-memory sessions (at most one socket per session)
 const activeSessions = new Map();
@@ -32,8 +34,9 @@ const groupMetadataCaches = new Map();
 const RUNNING_STATUSES = new Set(['connecting', 'qr_ready', 'connected']);
 const PAIRING_READY_TIMEOUT_MS = 20000;
 
-// Pino logger for Baileys (silent/error level to keep terminal clean)
-const logger = pino({ level: 'error' });
+// Application events, and Baileys internals (quiet by default, BAILEYS_LOG_LEVEL)
+const log = logger.child({ module: 'session' });
+const baileysLogger = logger.child({ module: 'baileys' }, { level: config.baileysLogLevel });
 
 function getSessionCache(caches, sessionId, ttlMs) {
   if (!caches.has(sessionId)) {
@@ -109,7 +112,7 @@ async function loadStoredMessage(sessionId, key) {
     const message = res.rows[0]?.message;
     return message ? proto.Message.fromObject(message) : undefined;
   } catch (error) {
-    console.error(`[Session ${sessionId}] getMessage lookup failed for ${key.id}:`, error.message);
+    log.error({ sessionId, messageId: key.id, err: error }, 'getMessage lookup failed');
     return undefined;
   }
 }
@@ -132,7 +135,7 @@ function scheduleReconnect(sessionData, delayMs) {
     try {
       await initSession(sessionId, { isReconnect: true });
     } catch (error) {
-      console.error(`[Session ${sessionId}] Reconnect attempt failed:`, error.message);
+      log.error({ sessionId, err: error }, 'Reconnect attempt failed');
       // No new socket took over: keep retrying with backoff
       if (activeSessions.get(sessionId) === sessionData) {
         sessionData.reconnectAttempts += 1;
@@ -177,7 +180,7 @@ async function handleOpen(sessionData) {
     [phone, sessionId]
   );
 
-  console.log(`[Session ${sessionId}] Connected successfully! Phone: ${phone}`);
+  log.info({ sessionId, phone }, 'Connected');
 
   sendWebhookEvent(sessionId, 'connection.update', {
     status: 'connected',
@@ -198,9 +201,9 @@ async function handleClose(sessionData, lastDisconnect) {
   const status = decision.action === 'reconnect' ? 'reconnecting' : 'disconnected';
   Object.assign(sessionData, { status, qrCode: null, qrRaw: null });
 
-  console.warn(
-    `[Session ${sessionId}] Connection closed (code: ${statusCode}) -> ${decision.action} (${decision.reason})` +
-      (decision.action === 'reconnect' ? ` in ${decision.delayMs}ms` : '')
+  log.warn(
+    { sessionId, statusCode, action: decision.action, reason: decision.reason, retryInMs: decision.delayMs },
+    'Connection closed'
   );
 
   // Act before touching the database so a DB outage cannot block the reconnect
@@ -211,7 +214,7 @@ async function handleClose(sessionData, lastDisconnect) {
     sessionData.stopped = true;
     activeSessions.delete(sessionId);
     if (decision.action === 'logout') {
-      console.log(`[Session ${sessionId}] Logged out. Clearing session auth keys.`);
+      log.info({ sessionId }, 'Logged out, clearing session auth keys');
       await clearAuthState(sessionId);
     }
   }
@@ -293,6 +296,39 @@ async function handleIncomingMessage(sessionData, msg) {
 }
 
 /**
+ * Applies a delivery receipt for one of our messages (forward-only) and emits `message.status`.
+ */
+async function handleAck(sessionData, key, update) {
+  const status = ackToStatus(update.status);
+  const allowedPrevious = status ? allowedPreviousStatuses(status) : [];
+  if (!allowedPrevious.length) return;
+
+  const { sessionId } = sessionData;
+  const error = status === 'failed' ? describeAckError(update.messageStubParameters?.[0]) : null;
+  const [historyRes, queueItem] = await Promise.all([
+    query(
+      `UPDATE messages SET status = $3, updated_at = NOW()
+       WHERE session_id = $1 AND message_id = $2 AND status = ANY($4::text[])`,
+      [sessionId, key.id, status, allowedPrevious]
+    ),
+    outboundQueue.applyAck(sessionId, key.id, status, allowedPrevious, error)
+  ]);
+  if (!historyRes.rowCount && !queueItem) return;
+
+  if (error) {
+    log.warn({ sessionId, messageId: key.id, error }, 'WhatsApp rejected a sent message');
+  }
+  sendWebhookEvent(sessionId, 'message.status', {
+    messageId: key.id,
+    queueId: queueItem ? Number(queueItem.id) : null,
+    remoteJid: key.remoteJid,
+    status,
+    error,
+    timestamp: new Date().toISOString()
+  });
+}
+
+/**
  * Creates or retrieves a WhatsApp Session Socket. Safe to call repeatedly: a session that already
  * has a running socket keeps it instead of opening a second one.
  */
@@ -336,11 +372,11 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   const sock = makeWASocket({
     // Use the WA Web version bundled with Baileys; WA_VERSION overrides it if WhatsApp rejects it (405)
     ...(config.waVersion ? { version: config.waVersion } : {}),
-    logger,
+    logger: baileysLogger,
     printQRInTerminal: false,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger)
+      keys: makeCacheableSignalKeyStore(state.keys, baileysLogger)
     },
     // A realistic browser is required for pairing codes and does not advertise automation
     browser: Browsers.macOS('Google Chrome'),
@@ -391,7 +427,7 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
       try {
         await handler(payload);
       } catch (error) {
-        console.error(`[Session ${sessionId}] Error handling ${event}:`, error);
+        log.error({ sessionId, event, err: error }, 'Error handling Baileys event');
       }
     });
   };
@@ -420,7 +456,19 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
       try {
         await handleIncomingMessage(sessionData, msg);
       } catch (err) {
-        console.error(`[Session ${sessionId}] Error processing message:`, err);
+        log.error({ sessionId, messageId: msg.key?.id, err }, 'Error processing incoming message');
+      }
+    }
+  });
+
+  // Delivery receipts for messages we sent (server ack, delivered, read, played, error)
+  on('messages.update', async (updates) => {
+    for (const { key, update } of updates) {
+      if (!key?.fromMe || update?.status === undefined || update?.status === null) continue;
+      try {
+        await handleAck(sessionData, key, update);
+      } catch (err) {
+        log.error({ sessionId, messageId: key.id, err }, 'Failed to apply message status update');
       }
     }
   });
@@ -470,42 +518,15 @@ export async function requestPairingCode(sessionId, phoneNumber, { countryCode }
   return { code, phoneNumber: phone };
 }
 
-function getConnectedSession(sessionId) {
+export function isSessionConnected(sessionId) {
   const session = activeSessions.get(sessionId);
-  if (!session || session.stopped || session.status !== 'connected') {
-    throw new AppError(409, `Session "${sessionId}" is not connected.`);
-  }
-  return session;
+  return Boolean(session && !session.stopped && session.status === 'connected');
 }
 
-/**
- * Turns a URL, base64 data URL or Buffer into a Buffer. Remote URLs are downloaded here (SSRF guard,
- * size cap, timeout) instead of letting Baileys fetch arbitrary URLs.
- */
-async function resolveMediaInput(input, label) {
-  if (Buffer.isBuffer(input)) {
-    return { buffer: input, contentType: null, sourceUrl: null };
-  }
-  if (typeof input === 'string' && /^https?:\/\//i.test(input)) {
-    const { buffer, contentType } = await fetchRemoteFile(input, {
-      allowPrivate: config.allowPrivateUrls,
-      maxBytes: config.mediaMaxBytes
-    });
-    return { buffer, contentType, sourceUrl: input };
-  }
-  if (typeof input === 'string' && input.startsWith('data:')) {
-    const commaIndex = input.indexOf(',');
-    const meta = commaIndex === -1 ? '' : input.slice(5, commaIndex);
-    if (!meta.endsWith(';base64')) {
-      throw new AppError(400, `Invalid ${label}: data URLs must be base64 encoded.`);
-    }
-    return {
-      buffer: Buffer.from(input.slice(commaIndex + 1), 'base64'),
-      contentType: meta.slice(0, -';base64'.length) || null,
-      sourceUrl: null
-    };
-  }
-  throw new AppError(400, `Invalid ${label}: expected an http(s) URL, a base64 data URL, or a file upload.`);
+export function getConnectedSessionIds() {
+  return [...activeSessions.values()]
+    .filter((session) => !session.stopped && session.status === 'connected')
+    .map((session) => session.sessionId);
 }
 
 async function saveOutgoingMessage(session, jid, result, { messageType, content, mediaUrl = null }) {
@@ -519,75 +540,72 @@ async function saveOutgoingMessage(session, jid, result, { messageType, content,
     );
   } catch (error) {
     // Already sent: report success rather than inviting the client to retry and send a duplicate
-    console.error(`[Session ${session.sessionId}] Failed to store sent message ${result.key.id}:`, error.message);
+    log.error({ sessionId: session.sessionId, messageId: result.key.id, err: error }, 'Failed to store sent message');
   }
 }
 
-/**
- * Send WhatsApp Text Message with simulated anti-ban typing presence
- */
-export async function sendTextMessage(sessionId, to, text, options = {}) {
-  const jid = normalizeTarget(to, options.countryCode ?? config.defaultCountryCode);
-  const session = getConnectedSession(sessionId);
-
-  const result = await sendWithHumanSimulation(session.sock, jid, { text }, options.delayMs);
-  await saveOutgoingMessage(session, jid, result, { messageType: 'text', content: text });
-
-  return {
-    success: true,
-    messageId: result.key.id,
-    remoteJid: jid,
-    status: 'sent'
-  };
+async function loadQueuedMedia(item) {
+  if (item.media_data) {
+    return { buffer: item.media_data, contentType: item.payload.mimetype || null };
+  }
+  return fetchRemoteFile(item.payload.url, { allowPrivate: config.allowPrivateUrls, maxBytes: config.mediaMaxBytes });
 }
 
 /**
- * Send WhatsApp Image Message with simulated anti-ban typing presence
+ * Sends one claimed queue item (called by the queue runner) and returns the WhatsApp message id.
+ * Throws AppError 503 when the session is not connected (retryable) and 4xx for bad input.
  */
-export async function sendImageMessage(sessionId, to, imageInput, caption = '', options = {}) {
-  const jid = normalizeTarget(to, options.countryCode ?? config.defaultCountryCode);
-  const session = getConnectedSession(sessionId);
-  const media = await resolveMediaInput(imageInput, 'image');
+export async function deliverQueuedMessage(item) {
+  const session = activeSessions.get(item.session_id);
+  if (!session || session.stopped || session.status !== 'connected') {
+    throw new AppError(503, `Session "${item.session_id}" is not connected.`);
+  }
 
-  const result = await sendWithHumanSimulation(session.sock, jid, { image: media.buffer, caption }, options.delayMs);
-  await saveOutgoingMessage(session, jid, result, { messageType: 'image', content: caption, mediaUrl: media.sourceUrl });
+  const { payload } = item;
+  let content;
+  let historyContent;
+  switch (item.message_type) {
+    case 'text':
+      content = { text: payload.text };
+      historyContent = payload.text;
+      break;
+    case 'image': {
+      const media = await loadQueuedMedia(item);
+      content = { image: media.buffer, caption: payload.caption || '' };
+      historyContent = payload.caption || '';
+      break;
+    }
+    case 'document': {
+      const media = await loadQueuedMedia(item);
+      content = {
+        document: media.buffer,
+        fileName: payload.fileName || 'file',
+        mimetype: payload.mimetype || media.contentType || 'application/octet-stream',
+        caption: payload.caption || ''
+      };
+      historyContent = payload.caption || payload.fileName || 'file';
+      break;
+    }
+    default:
+      throw new AppError(400, `Unsupported message type "${item.message_type}".`);
+  }
 
-  return {
-    success: true,
-    messageId: result.key.id,
-    remoteJid: jid,
-    status: 'sent'
-  };
-}
-
-/**
- * Send WhatsApp Attachment / Document with simulated anti-ban typing presence
- */
-export async function sendAttachmentMessage(sessionId, to, docInput, fileName = 'file', mimetype = null, caption = '', options = {}) {
-  const jid = normalizeTarget(to, options.countryCode ?? config.defaultCountryCode);
-  const session = getConnectedSession(sessionId);
-  const media = await resolveMediaInput(docInput, 'attachment');
-  const resolvedMimetype = mimetype || media.contentType || 'application/octet-stream';
-
-  const result = await sendWithHumanSimulation(
-    session.sock,
-    jid,
-    { document: media.buffer, fileName, mimetype: resolvedMimetype, caption },
-    options.delayMs
-  );
-  await saveOutgoingMessage(session, jid, result, {
-    messageType: 'document',
-    content: caption || fileName,
-    mediaUrl: media.sourceUrl
+  const result = await sendWithHumanSimulation(session.sock, item.target_jid, content, payload.delayMs);
+  await saveOutgoingMessage(session, item.target_jid, result, {
+    messageType: item.message_type,
+    content: historyContent,
+    mediaUrl: payload.url || null
   });
+  return result.key.id;
+}
 
-  return {
-    success: true,
-    messageId: result.key.id,
-    remoteJid: jid,
-    fileName,
-    status: 'sent'
-  };
+/**
+ * Closes every socket without logging out (graceful shutdown). Stored statuses are kept, so the
+ * sessions are restored on the next start.
+ */
+export function shutdownSessions() {
+  for (const session of activeSessions.values()) teardownSocket(session);
+  activeSessions.clear();
 }
 
 /**
@@ -711,21 +729,21 @@ export async function restoreSessions() {
       [sessionIds]
     );
 
-    console.log(`[Restore] Found ${sessionIds.length} paired session(s) to restore.`);
+    log.info({ count: sessionIds.length }, 'Restoring paired sessions');
 
     (async () => {
       for (const [index, sessionId] of sessionIds.entries()) {
         if (index > 0) await delay(config.restoreStaggerMs);
-        console.log(`[Restore] Restoring session: ${sessionId}`);
+        log.info({ sessionId }, 'Restoring session');
         try {
           await initSession(sessionId);
         } catch (err) {
-          console.error(`[Restore] Failed to restore session ${sessionId}:`, err.message);
+          log.error({ sessionId, err }, 'Failed to restore session');
         }
       }
     })();
   } catch (error) {
-    console.error('[Restore] Error restoring sessions from database:', error.message);
+    log.error({ err: error }, 'Error restoring sessions from database');
   }
 }
 
@@ -751,7 +769,7 @@ export async function downloadMediaByMessageId(sessionId, messageId) {
       'buffer',
       {},
       {
-        logger,
+        logger: baileysLogger,
         reuploadRequest: session?.sock?.updateMediaMessage
       }
     );
@@ -776,7 +794,7 @@ export async function downloadMediaByMessageId(sessionId, messageId) {
       fileLength: buffer.length
     };
   } catch (error) {
-    console.error(`[DownloadMedia] Error downloading media for message ${messageId}:`, error);
+    log.error({ sessionId, messageId, err: error }, 'Error downloading media');
     throw new Error(`Failed to decrypt and download media: ${error.message}`);
   }
 }

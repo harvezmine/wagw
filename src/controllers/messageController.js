@@ -1,20 +1,52 @@
-import {
-  sendTextMessage,
-  sendImageMessage,
-  sendAttachmentMessage,
-  requestPairingCode,
-  downloadMediaByMessageId
-} from '../services/sessionManager.js';
+import { requestPairingCode, downloadMediaByMessageId } from '../services/sessionManager.js';
+import { formatQueueItem, submitMessage } from '../services/messageService.js';
 import { query } from '../database/db.js';
 import { config } from '../config/index.js';
 import { AppError, sendError } from '../utils/errors.js';
-import { assertSessionId, parseOptionalInt } from '../utils/validation.js';
+import {
+  assertSessionId,
+  parseIdempotencyKey,
+  parseOptionalBool,
+  parseOptionalInt,
+  parseScheduleAt
+} from '../utils/validation.js';
 
-function parseSendOptions(body) {
+function parseQueueOptions(req) {
+  const { body } = req;
   return {
     delayMs: parseOptionalInt(body.delayMs, { name: 'delayMs', min: 0, max: config.antiBan.maxRequestDelayMs }),
-    countryCode: body.countryCode === undefined || body.countryCode === '' ? undefined : String(body.countryCode)
+    countryCode: body.countryCode === undefined || body.countryCode === '' ? undefined : String(body.countryCode),
+    scheduleAt: parseScheduleAt(body.scheduleAt),
+    idempotencyKey: parseIdempotencyKey(body.idempotencyKey ?? req.get('idempotency-key')),
+    connectOnly: parseOptionalBool(body.connectOnly, { name: 'connectOnly', defaultValue: true }),
+    wait: !parseOptionalBool(body.async, { name: 'async', defaultValue: false })
   };
+}
+
+/**
+ * 200 when the message was sent within SEND_WAIT_TIMEOUT_MS; 202 while it is queued or scheduled;
+ * the failure status (4xx for bad input, 502 otherwise) when sending failed.
+ */
+function respondToSubmission(res, { item, result, duplicate }, extra = {}) {
+  const queued = formatQueueItem(item);
+  if (duplicate) {
+    return res.status(200).json({ success: true, duplicate: true, ...queued });
+  }
+  if (result?.status === 'sent') {
+    return res.status(200).json({ success: true, messageId: result.messageId, remoteJid: queued.to, status: 'sent', queueId: queued.queueId, ...extra });
+  }
+  if (result?.status === 'failed') {
+    const status = result.httpStatus >= 400 && result.httpStatus < 500 ? result.httpStatus : 502;
+    return res.status(status).json({ success: false, status: 'failed', error: result.error, queueId: queued.queueId });
+  }
+  return res.status(202).json({
+    success: true,
+    status: result?.status ?? queued.status,
+    queueId: queued.queueId,
+    remoteJid: queued.to,
+    scheduledAt: queued.scheduledAt,
+    message: 'Message accepted. Track it with GET /api/queue/:queueId or the message.status webhook.'
+  });
 }
 
 export async function sendText(req, res) {
@@ -26,8 +58,8 @@ export async function sendText(req, res) {
     }
     assertSessionId(sessionId);
 
-    const result = await sendTextMessage(sessionId, to, text, parseSendOptions(req.body));
-    return res.status(200).json(result);
+    const submission = await submitMessage({ sessionId, to, type: 'text', content: { text }, ...parseQueueOptions(req) });
+    return respondToSubmission(res, submission);
   } catch (error) {
     return sendError(res, error, 'MessageController');
   }
@@ -44,8 +76,15 @@ export async function sendImage(req, res) {
     }
     assertSessionId(sessionId);
 
-    const result = await sendImageMessage(sessionId, to, imageInput, caption || '', parseSendOptions(req.body));
-    return res.status(200).json(result);
+    const submission = await submitMessage({
+      sessionId,
+      to,
+      type: 'image',
+      content: { caption: caption || '' },
+      media: { input: imageInput },
+      ...parseQueueOptions(req)
+    });
+    return respondToSubmission(res, submission);
   } catch (error) {
     return sendError(res, error, 'MessageController');
   }
@@ -61,16 +100,17 @@ export async function sendAttachment(req, res) {
     }
     assertSessionId(sessionId);
 
-    const result = await sendAttachmentMessage(
+    const resolvedFileName = fileName || req.file?.originalname || 'file';
+    const resolvedMimetype = mimetype || req.file?.mimetype || null;
+    const submission = await submitMessage({
       sessionId,
       to,
-      docInput,
-      fileName || req.file?.originalname || 'file',
-      mimetype || req.file?.mimetype || null,
-      caption || '',
-      parseSendOptions(req.body)
-    );
-    return res.status(200).json(result);
+      type: 'document',
+      content: { fileName: resolvedFileName, caption: caption || '', ...(resolvedMimetype ? { mimetype: resolvedMimetype } : {}) },
+      media: { input: docInput },
+      ...parseQueueOptions(req)
+    });
+    return respondToSubmission(res, submission, { fileName: resolvedFileName });
   } catch (error) {
     return sendError(res, error, 'MessageController');
   }

@@ -1,6 +1,7 @@
 import express from 'express';
 import sessionRoutes from './sessionRoutes.js';
 import messageRoutes from './messageRoutes.js';
+import queueRoutes from './queueRoutes.js';
 import { apiKeyAuth } from '../middlewares/auth.js';
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
@@ -27,5 +28,6 @@ if (config.nodeEnv !== 'production') {
 // Session routes apply auth themselves (the QR page also accepts signed links)
 router.use('/sessions', sessionRoutes);
 router.use('/messages', apiKeyAuth, messageRoutes);
+router.use('/queue', apiKeyAuth, queueRoutes);
 
 export default router;

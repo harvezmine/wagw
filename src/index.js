@@ -5,6 +5,8 @@ import { initDatabase } from './database/db.js';
 import { restoreSessions } from './services/sessionManager.js';
 import apiRoutes from './routes/index.js';
 import { logger } from './utils/logger.js';
+import { outboundQueue } from './services/outboundQueue.js';
+import { queueRunner } from './services/messageService.js';
 
 const app = express();
 
@@ -260,8 +262,14 @@ async function startServer() {
     logger.info('Connecting to PostgreSQL');
     await initDatabase();
 
+    const interrupted = await outboundQueue.recoverInterrupted();
+    if (interrupted) {
+      logger.warn({ count: interrupted }, 'Marked messages interrupted by the previous shutdown as failed');
+    }
+
     logger.info('Restoring previously active WhatsApp sessions');
     await restoreSessions();
+    queueRunner.start();
 
     app.listen(config.port, config.host, () => {
       logger.info({ url: `http://${config.host}:${config.port}`, docs: `http://localhost:${config.port}/` }, 'WhatsApp Web Gateway is running');
