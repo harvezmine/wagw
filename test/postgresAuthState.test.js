@@ -1,36 +1,20 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import pg from 'pg';
-import { createDb } from '../src/database/db.js';
-import { clearAuthState, usePostgresAuthState } from '../src/database/postgresAuthState.js';
+import { usePostgresAuthState } from '../src/database/postgresAuthState.js';
+import { createTestDatabase, dbSkip as skip } from './helpers/testDb.js';
 
-// Integration tests need a disposable PostgreSQL, e.g.:
-//   docker run -d --name wagw-test-pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:56999:5432 postgres:16-alpine
-//   DB_TEST=1 DB_HOST=127.0.0.1 DB_PORT=56999 DB_USER=postgres DB_PASSWORD=test DB_NAME=postgres npm test
-const skip = process.env.DB_TEST === '1' ? false : 'set DB_TEST=1 and DB_* env vars to run against PostgreSQL';
 const SESSION = 'test-auth-state';
-let pool;
+let database;
 let db;
 
 before(async () => {
   if (skip) return;
-  pool = new pg.Pool({
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT),
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME
-  });
-  await pool.query(fs.readFileSync(new URL('../src/database/schema.sql', import.meta.url), 'utf8'));
-  db = createDb(pool);
-  await clearAuthState(SESSION, db);
+  database = await createTestDatabase();
+  db = database.db;
 });
 
 after(async () => {
-  if (!pool) return;
-  await clearAuthState(SESSION, db);
-  await pool.end();
+  if (database) await database.drop();
 });
 
 test('read failures are thrown instead of silently generating new creds', async () => {

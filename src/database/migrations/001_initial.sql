@@ -1,4 +1,4 @@
--- WhatsApp Gateway Database Schema
+-- Base schema. Idempotent, so databases created before migrations existed upgrade cleanly.
 
 CREATE TABLE IF NOT EXISTS sessions (
     id VARCHAR(100) PRIMARY KEY,
@@ -58,3 +58,9 @@ CREATE TABLE IF NOT EXISTS webhook_logs (
     error_message TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Columns added after the first release (previously ad-hoc ALTERs in initDatabase)
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_jid VARCHAR(150);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS push_name VARCHAR(150);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS disconnect_reason VARCHAR(100);

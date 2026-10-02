@@ -2,12 +2,7 @@ import pkg from 'pg';
 const { Pool } = pkg;
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { runMigrations } from './migrate.js';
 
 /**
  * Query helpers bound to a pool. `withTransaction` runs `fn(client)` inside BEGIN/COMMIT and
@@ -54,22 +49,8 @@ export const query = db.query;
 export const withTransaction = db.withTransaction;
 
 export async function initDatabase() {
-  try {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schemaSql = fs.readFileSync(schemaPath, 'utf8');
-    await pool.query(schemaSql);
-
-    // Auto-migration for existing tables
-    await pool.query(`
-      ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
-      ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_jid VARCHAR(150);
-      ALTER TABLE messages ADD COLUMN IF NOT EXISTS push_name VARCHAR(150);
-      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS disconnect_reason VARCHAR(100);
-    `);
-
-    logger.info('Database tables initialized and verified');
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to initialize database tables');
-    throw error;
-  }
+  const applied = await runMigrations(pool, {
+    log: (version) => logger.info({ migration: version }, 'Applied database migration')
+  });
+  logger.info({ applied: applied.length }, 'Database schema is up to date');
 }
