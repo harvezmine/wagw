@@ -1,3 +1,4 @@
+import { toNumber } from '@whiskeysockets/baileys';
 import { query } from '../database/db.js';
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
@@ -84,7 +85,7 @@ export function extractMessageData(msg) {
       content = message.imageMessage.caption || '';
       media = {
         mimetype: message.imageMessage.mimetype,
-        fileLength: message.imageMessage.fileLength,
+        fileLength: toNumber(message.imageMessage.fileLength),
         url: message.imageMessage.url,
         height: message.imageMessage.height,
         width: message.imageMessage.width
@@ -96,8 +97,8 @@ export function extractMessageData(msg) {
       content = message.videoMessage.caption || '';
       media = {
         mimetype: message.videoMessage.mimetype,
-        fileLength: message.videoMessage.fileLength,
-        seconds: message.videoMessage.seconds,
+        fileLength: toNumber(message.videoMessage.fileLength),
+        seconds: toNumber(message.videoMessage.seconds),
         gifPlayback: message.videoMessage.gifPlayback
       };
       break;
@@ -106,8 +107,8 @@ export function extractMessageData(msg) {
       normalizedType = message.audioMessage.ptt ? 'voice' : 'audio';
       media = {
         mimetype: message.audioMessage.mimetype,
-        fileLength: message.audioMessage.fileLength,
-        seconds: message.audioMessage.seconds,
+        fileLength: toNumber(message.audioMessage.fileLength),
+        seconds: toNumber(message.audioMessage.seconds),
         ptt: message.audioMessage.ptt
       };
       break;
@@ -118,8 +119,8 @@ export function extractMessageData(msg) {
       media = {
         fileName: message.documentMessage.fileName || 'attachment',
         mimetype: message.documentMessage.mimetype,
-        fileLength: message.documentMessage.fileLength,
-        pageCount: message.documentMessage.pageCount
+        fileLength: toNumber(message.documentMessage.fileLength),
+        pageCount: toNumber(message.documentMessage.pageCount)
       };
       break;
 
@@ -127,7 +128,7 @@ export function extractMessageData(msg) {
       normalizedType = 'sticker';
       media = {
         mimetype: message.stickerMessage.mimetype,
-        fileLength: message.stickerMessage.fileLength,
+        fileLength: toNumber(message.stickerMessage.fileLength),
         isAnimated: message.stickerMessage.isAnimated
       };
       break;

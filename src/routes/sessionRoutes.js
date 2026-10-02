@@ -10,7 +10,8 @@ import {
   logout,
   deleteSession,
   listWebhookDeliveries,
-  retryWebhookDelivery
+  retryWebhookDelivery,
+  getLimits
 } from '../controllers/sessionController.js';
 import { apiKeyAuth, qrPageAuth } from '../middlewares/auth.js';
 import { validateSessionIdParam } from '../utils/validation.js';
@@ -27,6 +28,7 @@ router.use(apiKeyAuth);
 router.post('/init', initSession);
 router.get('/', listSessions);
 router.get('/:sessionId/status', getStatus);
+router.get('/:sessionId/limits', getLimits);
 router.post('/:sessionId/qr-link', createQrLink);
 router.post('/:sessionId/pairing-code', requestPairingCode);
 router.put('/:sessionId/webhook', updateWebhook);

@@ -6,6 +6,7 @@ import {
   requestPairingCode as requestPairingCodeService,
   logoutSession,
   deleteSession as deleteSessionService,
+  getSessionLimits,
   setSessionWebhookConfig
 } from '../services/sessionManager.js';
 import { webhookOutbox } from '../services/webhookOutbox.js';
@@ -233,6 +234,15 @@ export async function retryWebhookDelivery(req, res) {
     }
     webhookDispatcher.wake();
     return res.status(200).json({ success: true, deliveryId, status: 'pending' });
+  } catch (error) {
+    return sendError(res, error, 'SessionController');
+  }
+}
+
+export async function getLimits(req, res) {
+  try {
+    const limits = await getSessionLimits(req.params.sessionId);
+    return res.status(200).json({ success: true, sessionId: req.params.sessionId, ...limits });
   } catch (error) {
     return sendError(res, error, 'SessionController');
   }

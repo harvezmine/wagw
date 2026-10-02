@@ -3,7 +3,8 @@ import makeWASocket, {
   delay,
   downloadMediaMessage,
   makeCacheableSignalKeyStore,
-  proto
+  proto,
+  toNumber
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import { query } from '../database/db.js';
@@ -13,6 +14,7 @@ import { backoffDelay, decideReconnect } from './reconnectPolicy.js';
 import { config } from '../config/index.js';
 import { AppError } from '../utils/errors.js';
 import { normalizePhoneNumber } from '../utils/phone.js';
+import { describeMessageAddress, phoneFromJid } from '../utils/jid.js';
 import { createKeyedLock } from '../utils/keyedLock.js';
 import { createTtlCache } from '../utils/ttlCache.js';
 import { assertSafeUrl, fetchRemoteFile } from '../utils/netGuard.js';
@@ -43,10 +45,6 @@ function getSessionCache(caches, sessionId, ttlMs) {
     caches.set(sessionId, createTtlCache({ ttlMs }));
   }
   return caches.get(sessionId);
-}
-
-function phoneFromJid(jid) {
-  return jid ? jid.split('@')[0].split(':')[0] : null;
 }
 
 function withTimeout(promise, ms, message) {
@@ -237,11 +235,11 @@ async function handleIncomingMessage(sessionData, msg) {
   const { sessionId, sock } = sessionData;
   if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
-  const remoteJid = msg.key.remoteJid;
+  // Chats may be addressed by LID (Baileys v7); the phone-number JID is kept alongside
+  const { remoteJid, remoteJidAlt, senderJid, senderJidAlt, senderPhone, isGroup } = describeMessageAddress(msg.key);
   const fromMe = Boolean(msg.key.fromMe);
   const messageId = msg.key.id;
   const pushName = msg.pushName || '';
-  const senderJid = msg.key.participant || remoteJid;
 
   // Extract and normalize message type and content
   const parsed = extractMessageData(msg);
@@ -255,8 +253,8 @@ async function handleIncomingMessage(sessionData, msg) {
 
   // Store message in PostgreSQL
   await query(
-    `INSERT INTO messages (session_id, message_id, remote_jid, sender_jid, from_me, push_name, message_type, content, raw_payload, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+    `INSERT INTO messages (session_id, message_id, remote_jid, sender_jid, from_me, push_name, message_type, content, raw_payload, status, remote_jid_alt, sender_jid_alt)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
      ON CONFLICT (session_id, message_id) DO UPDATE
      SET status = EXCLUDED.status, updated_at = NOW()`,
     [
@@ -269,7 +267,9 @@ async function handleIncomingMessage(sessionData, msg) {
       parsed.messageType,
       parsed.content,
       JSON.stringify(msg),
-      fromMe ? 'sent' : 'received'
+      fromMe ? 'sent' : 'received',
+      remoteJidAlt,
+      senderJidAlt
     ]
   );
 
@@ -282,16 +282,19 @@ async function handleIncomingMessage(sessionData, msg) {
   sendWebhookEvent(sessionId, 'message.received', {
     messageId,
     remoteJid,
+    remoteJidAlt,
     senderJid,
+    senderJidAlt,
+    senderPhone,
     fromMe,
     pushName,
-    isGroup: remoteJid.endsWith('@g.us'),
+    isGroup,
     messageType: parsed.messageType,
     rawType: parsed.rawType,
     content: parsed.content,
     media: parsed.media,
     contextInfo: parsed.contextInfo,
-    timestamp: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString()
+    timestamp: msg.messageTimestamp ? new Date(toNumber(msg.messageTimestamp) * 1000).toISOString() : new Date().toISOString()
   });
 }
 
@@ -443,7 +446,12 @@ async function startSession(sessionId, { customName = null, webhookUrl = null, i
   });
 
   // Connection update listener
-  on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+  on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    // Baileys v7 reports reach-out restrictions (the cause of error 463) through connection updates
+    if (update.reachoutTimeLock) {
+      sendWebhookEvent(sessionId, 'account.restriction', update.reachoutTimeLock);
+    }
     if (qr) await handleQr(sessionData, qr);
     if (connection === 'open') await handleOpen(sessionData);
     if (connection === 'close') await handleClose(sessionData, lastDisconnect);
@@ -606,6 +614,26 @@ export async function deliverQueuedMessage(item) {
 export function shutdownSessions() {
   for (const session of activeSessions.values()) teardownSocket(session);
   activeSessions.clear();
+}
+
+/**
+ * Current WhatsApp restrictions of the account (Baileys v7): new-chat message cap and reach-out timelock.
+ */
+export async function getSessionLimits(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session || session.stopped || session.status !== 'connected') {
+    throw new AppError(409, `Session "${sessionId}" is not connected.`);
+  }
+  const { sock } = session;
+  if (typeof sock.fetchNewChatMessageCap !== 'function' || typeof sock.fetchAccountReachoutTimelock !== 'function') {
+    throw new AppError(501, 'Account limits require Baileys v7.');
+  }
+  const [newChatMessageCap, reachoutTimelock] = await Promise.allSettled([
+    sock.fetchNewChatMessageCap(),
+    sock.fetchAccountReachoutTimelock()
+  ]);
+  const unwrap = (result) => (result.status === 'fulfilled' ? result.value : { error: result.reason?.message || 'Request failed' });
+  return { newChatMessageCap: unwrap(newChatMessageCap), reachoutTimelock: unwrap(reachoutTimelock) };
 }
 
 /**

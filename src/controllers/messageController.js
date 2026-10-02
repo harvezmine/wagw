@@ -151,7 +151,7 @@ export async function getMessages(req, res) {
 
     if (remoteJid) {
       params.push(`%${remoteJid}%`);
-      sql += ` AND remote_jid LIKE $${params.length}`;
+      sql += ` AND (remote_jid LIKE $${params.length} OR remote_jid_alt LIKE $${params.length})`;
     }
 
     if (type) {
