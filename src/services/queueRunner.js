@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 /**
  * Sends queued messages: at most one message in flight per session, a randomised gap between
  * consecutive sends of the same session, sessions processed in parallel. Transient errors are retried.
+ * An optional `gate` (see sendGate.js) decides per message to send, defer or skip it.
  */
 export function createQueueRunner({
   queue,
@@ -15,6 +16,8 @@ export function createQueueRunner({
   retryDelayMs = 30000,
   maxAgeMs = 0,
   onResult = null,
+  gate = null,
+  maxDecisionsPerTick = 50,
   now = Date.now,
   random = Math.random,
   logger = null
@@ -56,28 +59,61 @@ export function createQueueRunner({
     finish(item, { status: 'failed', error: error.message, httpStatus: error.status ?? null });
   }
 
+  async function decide(item) {
+    if (!gate) return { action: 'send', newContact: false };
+    try {
+      return await gate.evaluate(item);
+    } catch (error) {
+      // Never send unchecked: try again later
+      logger?.error({ queueId: item.id, sessionId: item.session_id, err: error }, 'Send guard failed, message deferred');
+      return { action: 'defer', until: new Date(now() + retryDelayMs), reason: `send guard unavailable: ${error.message}` };
+    }
+  }
+
+  /** @returns {Promise<'sent' | 'failed' | 'deferred' | 'skipped'>} */
   async function processItem(item) {
+    const decision = await decide(item);
+    if (decision.action === 'defer') {
+      // At least a second ahead, so a bad decision cannot spin on the same message
+      const until = new Date(Math.max(new Date(decision.until).getTime(), now() + 1000));
+      await queue.defer(item.id, until, decision.reason);
+      notify(item.id, { status: 'queued', deferredUntil: until, reason: decision.reason });
+      return 'deferred';
+    }
+    if (decision.action === 'skip') {
+      await queue.markSkipped(item.id, decision.reason);
+      logger?.info({ queueId: item.id, sessionId: item.session_id, reason: decision.reason }, 'Message skipped by the send guard');
+      finish(item, { status: 'skipped', error: decision.reason });
+      return 'skipped';
+    }
+
     let messageId;
     try {
       messageId = await sendItem(item);
     } catch (error) {
       await handleFailure(item, error);
-      return;
+      return 'failed';
     }
+    gate?.recordSent(item, decision);
     try {
-      await queue.markSent(item.id, messageId);
+      await queue.markSent(item.id, messageId, { newContact: Boolean(decision.newContact) });
     } catch (error) {
       // The message is out: never retry it. The row stays "processing" and is failed on restart.
       logger?.error({ queueId: item.id, err: error }, 'Message sent but its queue status could not be updated');
     }
     finish(item, { status: 'sent', messageId });
+    return 'sent';
   }
 
+  /** Works through deferred/skipped messages until one is actually sent (or tried). True when one was. */
   async function runSession(sessionId) {
-    const item = await queue.claimNext(sessionId);
-    if (!item) return false;
-    await processItem(item);
-    return true;
+    for (let decisions = 0; decisions < maxDecisionsPerTick; decisions += 1) {
+      const item = await queue.claimNext(sessionId);
+      if (!item) return false;
+      const outcome = await processItem(item);
+      if (outcome === 'sent' || outcome === 'failed') return true;
+    }
+    return false;
   }
 
   async function expireStale() {

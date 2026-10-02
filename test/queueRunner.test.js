@@ -30,7 +30,12 @@ function createFakeQueue(items) {
       row.attempts += 1;
       return { ...row };
     },
-    async markSent(id, messageId) { Object.assign(find(id), { status: 'sent', messageId }); },
+    async markSent(id, messageId, meta = {}) { Object.assign(find(id), { status: 'sent', messageId, meta }); },
+    async defer(id, until, reason) {
+      const row = find(id);
+      Object.assign(row, { status: 'queued', attempts: row.attempts - 1, dueAt: until.getTime(), reason });
+    },
+    async markSkipped(id, reason) { Object.assign(find(id), { status: 'skipped', reason }); },
     async markFailed(id, error) { Object.assign(find(id), { status: 'failed', error }); },
     async requeue(id, error, delayMs) { Object.assign(find(id), { status: 'queued', error, dueAt: Date.now() + delayMs }); },
     async expireStale() { return []; }
@@ -150,4 +155,77 @@ test('stop waits for the message being sent', async () => {
   await waitUntil(() => queue.find(1).status === 'processing');
   await runner.stop();
   assert.equal(queue.find(1).status, 'sent');
+});
+
+function createFakeGate(decide) {
+  const recorded = [];
+  return {
+    recorded,
+    async evaluate(item) {
+      return decide(item);
+    },
+    recordSent(item, decision) {
+      recorded.push([item.id, decision.newContact]);
+    }
+  };
+}
+
+test('deferred messages go back to the queue without using an attempt and do not hold up the next one', async () => {
+  const queue = createFakeQueue([{ id: 1, session_id: 's1' }, { id: 2, session_id: 's1' }]);
+  const gate = createFakeGate((item) =>
+    item.id === 1 ? { action: 'defer', until: new Date(Date.now() + 60000), reason: 'daily new-chat limit' } : { action: 'send', newContact: false }
+  );
+  const runner = createRunner(queue, { gate });
+  const waiting = runner.waitFor(1, 1000);
+  runner.start();
+  await waitUntil(() => queue.find(2).status === 'sent');
+  await runner.stop();
+  assert.equal(queue.find(1).status, 'queued');
+  assert.equal(queue.find(1).attempts, 0);
+  assert.equal(queue.find(1).reason, 'daily new-chat limit');
+  const result = await waiting;
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'daily new-chat limit');
+  assert.ok(result.deferredUntil instanceof Date);
+});
+
+test('skipped messages end with status skipped and a reason', async () => {
+  const queue = createFakeQueue([{ id: 1, session_id: 's1' }]);
+  const results = [];
+  const runner = createRunner(queue, {
+    gate: createFakeGate(() => ({ action: 'skip', reason: 'recipient opted out' })),
+    sendItem: async () => assert.fail('must not send'),
+    onResult: (result) => results.push(result)
+  });
+  runner.start();
+  await waitUntil(() => results.length === 1);
+  await runner.stop();
+  assert.equal(queue.find(1).status, 'skipped');
+  assert.deepEqual(results[0], { id: 1, sessionId: 's1', to: '62811@s.whatsapp.net', status: 'skipped', error: 'recipient opted out' });
+});
+
+test('sends record whether they opened a new chat', async () => {
+  const queue = createFakeQueue([{ id: 1, session_id: 's1' }]);
+  const gate = createFakeGate(() => ({ action: 'send', newContact: true }));
+  const runner = createRunner(queue, { gate });
+  runner.start();
+  await waitUntil(() => queue.find(1).status === 'sent');
+  await runner.stop();
+  assert.deepEqual(queue.find(1).meta, { newContact: true });
+  assert.deepEqual(gate.recorded, [[1, true]]);
+});
+
+test('a failing gate defers instead of sending unchecked', async () => {
+  const queue = createFakeQueue([{ id: 1, session_id: 's1' }]);
+  const runner = createRunner(queue, {
+    gate: createFakeGate(() => {
+      throw new Error('database down');
+    }),
+    sendItem: async () => assert.fail('must not send')
+  });
+  runner.start();
+  await waitUntil(() => queue.find(1).reason !== undefined);
+  await runner.stop();
+  assert.equal(queue.find(1).status, 'queued');
+  assert.match(queue.find(1).reason, /send guard unavailable: database down/);
 });
