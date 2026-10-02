@@ -23,6 +23,9 @@ export async function createTestDatabase({ migrate = true } = {}) {
   const name = `wagw_test_${process.pid}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   await admin.query(`CREATE DATABASE ${name}`);
   const pool = poolFor(name);
+  // DROP DATABASE ... WITH (FORCE) may terminate a connection pool.end() is still closing; without a
+  // listener that termination surfaces as an uncaught 'error' event
+  pool.on('error', () => {});
   if (migrate) await runMigrations(pool);
   return {
     name,
