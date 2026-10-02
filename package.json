@@ -1,0 +1,36 @@
+{
+  "name": "whatsapp-web-gateway-api",
+  "version": "1.0.0",
+  "description": "WhatsApp Web Gateway API based on Node.js and Baileys with Multi-device, PostgreSQL storage, Anti-Ban Typing Simulation, and Webhooks",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "gateway",
+    "multi-device",
+    "postgresql",
+    "docker"
+  ],
+  "author": "Antigravity",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.19",
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.13.1",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}

@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: whatsapp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-whatsapp_gateway}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-whatsapp_gateway}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  whatsapp-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp_gateway_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      HOST: 0.0.0.0
+      NODE_ENV: production
+      API_KEY: ${API_KEY:-}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-whatsapp_gateway}
+      GLOBAL_WEBHOOK_URL: ${GLOBAL_WEBHOOK_URL:-}
+      MIN_TYPING_DELAY_MS: ${MIN_TYPING_DELAY_MS:-1200}
+      MAX_TYPING_DELAY_MS: ${MAX_TYPING_DELAY_MS:-3000}
+      AUTO_READ_MESSAGES: ${AUTO_READ_MESSAGES:-true}
+    ports:
+      - "${PORT:-3000}:3000"
+
+volumes:
+  pgdata:
+    driver: local
