@@ -12,6 +12,9 @@ import { webhookDispatcher } from './services/webhookService.js';
 const app = express();
 let server = null;
 
+// Needed behind a reverse proxy so req.ip (used by API key IP allowlists) is the client address
+app.set('trust proxy', config.trustProxy);
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));

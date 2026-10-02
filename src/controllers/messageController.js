@@ -1,5 +1,6 @@
 import { requestPairingCode, downloadMediaByMessageId } from '../services/sessionManager.js';
 import { formatQueueItem, submitBatch, submitMessage } from '../services/messageService.js';
+import { assertSessionAccess } from '../middlewares/auth.js';
 import { KEY_TYPES, parseMessageInput } from '../services/messageContent.js';
 import { isBulkTarget } from '../services/bulkTargets.js';
 import { query } from '../database/db.js';
@@ -65,6 +66,7 @@ export async function sendMessage(req, res) {
   try {
     const { sessionId, to, replyTo } = req.body;
     assertSessionId(sessionId);
+    assertSessionAccess(req, sessionId);
     const options = parseQueueOptions(req);
     const { type, payload, media } = parseMessageInput(req.body, {
       file: req.file,
@@ -107,6 +109,7 @@ export async function sendText(req, res) {
       throw new AppError(400, 'Required fields missing: sessionId, to, text are required.');
     }
     assertSessionId(sessionId);
+    assertSessionAccess(req, sessionId);
 
     const submission = await submitMessage({ sessionId, to, type: 'text', payload: { text }, ...parseQueueOptions(req) });
     return respondToSubmission(res, submission);
@@ -125,6 +128,7 @@ export async function sendImage(req, res) {
       throw new AppError(400, 'Required fields missing: sessionId, to, and imageUrl (or file upload) are required.');
     }
     assertSessionId(sessionId);
+    assertSessionAccess(req, sessionId);
 
     const submission = await submitMessage({
       sessionId,
@@ -149,6 +153,7 @@ export async function sendAttachment(req, res) {
       throw new AppError(400, 'Required fields missing: sessionId, to, and attachmentUrl (or file upload) are required.');
     }
     assertSessionId(sessionId);
+    assertSessionAccess(req, sessionId);
 
     const resolvedFileName = fileName || req.file?.originalname || 'file';
     const resolvedMimetype = mimetype || req.file?.mimetype || null;
@@ -174,6 +179,7 @@ export async function sendPairingCode(req, res) {
       throw new AppError(400, 'sessionId and phoneNumber are required.');
     }
     assertSessionId(sessionId);
+    assertSessionAccess(req, sessionId);
 
     const { code, phoneNumber: normalizedPhone } = await requestPairingCode(sessionId, phoneNumber, { countryCode });
 

@@ -10,6 +10,7 @@ import {
   downloadMedia
 } from '../controllers/messageController.js';
 import { validateSessionIdParam } from '../utils/validation.js';
+import { requireSessionAccess } from '../middlewares/auth.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -25,7 +26,7 @@ router.post('/send-text', sendText);
 router.post('/send-image', upload.single('file'), sendImage);
 router.post('/send-attachment', upload.single('file'), sendAttachment);
 router.post('/send-pairing-code', sendPairingCode);
-router.get('/:sessionId', getMessages);
-router.get('/:sessionId/download/:messageId', downloadMedia);
+router.get('/:sessionId', requireSessionAccess, getMessages);
+router.get('/:sessionId/download/:messageId', requireSessionAccess, downloadMedia);
 
 export default router;

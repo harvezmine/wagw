@@ -18,7 +18,7 @@ import {
   getSettings,
   updateSettings
 } from '../controllers/sessionController.js';
-import { apiKeyAuth, qrPageAuth } from '../middlewares/auth.js';
+import { authenticate, qrPageAuth, requireSessionAccess } from '../middlewares/auth.js';
 import { validateSessionIdParam } from '../utils/validation.js';
 
 const router = express.Router();
@@ -26,25 +26,25 @@ const router = express.Router();
 router.param('sessionId', validateSessionIdParam);
 
 // The QR page can be opened in a browser with a signed ?token= link instead of the API key header
-router.get('/:sessionId/qr', qrPageAuth, getQrCode);
+router.get('/:sessionId/qr', qrPageAuth, requireSessionAccess, getQrCode);
 
-// Every other session route requires the x-api-key header
-router.use(apiKeyAuth);
+// Every other session route requires the x-api-key header; tenant keys only reach their own sessions
+router.use(authenticate);
 router.post('/init', initSession);
 router.get('/', listSessions);
-router.get('/:sessionId/status', getStatus);
-router.get('/:sessionId/limits', getLimits);
-router.post('/:sessionId/validate', validateSessionNumbers);
-router.get('/:sessionId/groups', getGroups);
-router.get('/:sessionId/groups/:groupId', getGroupDetail);
-router.get('/:sessionId/settings', getSettings);
-router.patch('/:sessionId/settings', updateSettings);
-router.post('/:sessionId/qr-link', createQrLink);
-router.post('/:sessionId/pairing-code', requestPairingCode);
-router.put('/:sessionId/webhook', updateWebhook);
-router.get('/:sessionId/webhook-deliveries', listWebhookDeliveries);
-router.post('/:sessionId/webhook-deliveries/:deliveryId/retry', retryWebhookDelivery);
-router.post('/:sessionId/logout', logout);
-router.delete('/:sessionId', deleteSession);
+router.get('/:sessionId/status', requireSessionAccess, getStatus);
+router.get('/:sessionId/limits', requireSessionAccess, getLimits);
+router.post('/:sessionId/validate', requireSessionAccess, validateSessionNumbers);
+router.get('/:sessionId/groups', requireSessionAccess, getGroups);
+router.get('/:sessionId/groups/:groupId', requireSessionAccess, getGroupDetail);
+router.get('/:sessionId/settings', requireSessionAccess, getSettings);
+router.patch('/:sessionId/settings', requireSessionAccess, updateSettings);
+router.post('/:sessionId/qr-link', requireSessionAccess, createQrLink);
+router.post('/:sessionId/pairing-code', requireSessionAccess, requestPairingCode);
+router.put('/:sessionId/webhook', requireSessionAccess, updateWebhook);
+router.get('/:sessionId/webhook-deliveries', requireSessionAccess, listWebhookDeliveries);
+router.post('/:sessionId/webhook-deliveries/:deliveryId/retry', requireSessionAccess, retryWebhookDelivery);
+router.post('/:sessionId/logout', requireSessionAccess, logout);
+router.delete('/:sessionId', requireSessionAccess, deleteSession);
 
 export default router;

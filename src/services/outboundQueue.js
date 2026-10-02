@@ -83,12 +83,14 @@ export function createOutboundQueue(db = defaultDb) {
       return res.rows[0] || null;
     },
 
-    async list({ sessionId = null, status = null, limit = 50, offset = 0 } = {}) {
+    /** `sessionIds` (array) restricts the listing to those sessions, e.g. for tenant API keys. */
+    async list({ sessionId = null, sessionIds = null, status = null, limit = 50, offset = 0 } = {}) {
       const res = await db.query(
         `SELECT ${PUBLIC_COLUMNS} FROM outbound_messages
          WHERE ($1::text IS NULL OR session_id = $1) AND ($2::text IS NULL OR status = $2)
+           AND ($5::text[] IS NULL OR session_id = ANY($5::text[]))
          ORDER BY id DESC LIMIT $3 OFFSET $4`,
-        [sessionId, status, limit, offset]
+        [sessionId, status, limit, offset, sessionIds]
       );
       return res.rows;
     },

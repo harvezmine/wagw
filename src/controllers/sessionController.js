@@ -17,7 +17,7 @@ import { parseSettingsUpdate } from '../services/sessionSettings.js';
 import { webhookOutbox } from '../services/webhookOutbox.js';
 import { validateNumbers } from '../services/numberService.js';
 import { webhookDispatcher } from '../services/webhookService.js';
-import { createQrLinkToken } from '../middlewares/auth.js';
+import { allowedSessionIds, assertSessionAccess, createQrLinkToken } from '../middlewares/auth.js';
 import { config } from '../config/index.js';
 import { AppError, sendError } from '../utils/errors.js';
 import { assertSessionId, parseOptionalBool, parseOptionalInt } from '../utils/validation.js';
@@ -40,6 +40,7 @@ export async function initSession(req, res) {
   try {
     const { sessionId, customName, webhookUrl } = req.body;
     assertSessionId(sessionId);
+    assertSessionAccess(req, sessionId);
 
     await initSessionService(sessionId, { customName, webhookUrl });
 
@@ -167,7 +168,8 @@ export async function getStatus(req, res) {
 
 export async function listSessions(req, res) {
   try {
-    const sessions = await getAllSessions();
+    const allowed = allowedSessionIds(req);
+    const sessions = (await getAllSessions()).filter((session) => !allowed || allowed.includes(session.id));
     return res.status(200).json({
       success: true,
       count: sessions.length,

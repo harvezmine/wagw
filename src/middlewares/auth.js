@@ -1,5 +1,9 @@
 import crypto from 'node:crypto';
 import { config } from '../config/index.js';
+import { AppError, sendError } from '../utils/errors.js';
+import { apiKeyStore, ipAllowed } from '../services/apiKeys.js';
+
+const ADMIN_AUTH = Object.freeze({ isAdmin: true, keyId: null, sessionIds: null });
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value)).digest();
@@ -22,7 +26,7 @@ function unauthorized(res) {
 }
 
 /**
- * Signed, short-lived token that lets a browser open one session's QR page without the API key.
+ * Signed, short-lived token that lets a browser open one session's QR page without an API key.
  */
 export function createQrLinkToken(sessionId, { secret = config.apiKey, ttlSeconds = config.qrLinkTtlSeconds, now = Date.now } = {}) {
   const expiresAt = Math.floor(now() / 1000) + ttlSeconds;
@@ -43,30 +47,79 @@ export function verifyQrLinkToken(sessionId, token, { secret = config.apiKey, no
 }
 
 /**
- * API key auth via the `x-api-key` header only (query-string keys leak into logs and browser history).
- * Without a configured key (allowed outside production only, see validateConfig) requests pass through.
+ * Identifies the caller from the x-api-key header (query-string keys leak into logs and are ignored):
+ * - the master API_KEY: admin, every session and key management
+ * - a tenant key (wagw_…): only its sessions, optionally only from allowed IPs
+ * Without API_KEY (development only, see validateConfig) every caller is admin.
  */
-export function createApiKeyAuth({ apiKey }) {
-  return (req, res, next) => {
-    if (!apiKey) return next();
-    const provided = req.get('x-api-key');
-    if (provided && safeEqual(provided, apiKey)) return next();
-    return unauthorized(res);
+async function resolveAuth(req, { apiKey, keyStore }) {
+  if (!apiKey) return ADMIN_AUTH;
+  const provided = req.get('x-api-key');
+  if (!provided) return null;
+  if (safeEqual(provided, apiKey)) return ADMIN_AUTH;
+  const key = await keyStore.resolve(provided);
+  if (!key) return null;
+  if (key.ip_allowlist && !ipAllowed(key.ip_allowlist, req.ip)) {
+    throw new AppError(403, 'This API key is not allowed from your IP address.');
+  }
+  return { isAdmin: false, keyId: Number(key.id), sessionIds: key.session_ids };
+}
+
+export function createAuthenticate({ apiKey, keyStore }) {
+  return async (req, res, next) => {
+    try {
+      const auth = await resolveAuth(req, { apiKey, keyStore });
+      if (!auth) return unauthorized(res);
+      req.auth = auth;
+      return next();
+    } catch (error) {
+      return sendError(res, error, 'Auth');
+    }
   };
 }
 
 /**
- * Like createApiKeyAuth, but also accepts a signed QR link token (?token=) for the session in the URL.
+ * The QR page also accepts a signed ?token= link, which grants access to that one session.
  */
-export function createQrPageAuth({ apiKey }) {
-  const apiKeyAuth = createApiKeyAuth({ apiKey });
+export function createQrPageAuth({ apiKey, keyStore }) {
+  const authenticate = createAuthenticate({ apiKey, keyStore });
   return (req, res, next) => {
     if (apiKey && verifyQrLinkToken(req.params.sessionId, req.query.token, { secret: apiKey })) {
+      req.auth = { isAdmin: false, keyId: null, sessionIds: [req.params.sessionId] };
       return next();
     }
-    return apiKeyAuth(req, res, next);
+    return authenticate(req, res, next);
   };
 }
 
-export const apiKeyAuth = createApiKeyAuth({ apiKey: config.apiKey });
-export const qrPageAuth = createQrPageAuth({ apiKey: config.apiKey });
+export function canAccessSession(auth, sessionId) {
+  return Boolean(auth && (auth.isAdmin || auth.sessionIds === null || auth.sessionIds.includes(sessionId)));
+}
+
+export function assertSessionAccess(req, sessionId) {
+  if (!canAccessSession(req.auth, sessionId)) {
+    throw new AppError(403, `This API key has no access to session "${sessionId}".`);
+  }
+}
+
+/** Sessions the caller may see, or null for all. */
+export function allowedSessionIds(req) {
+  return req.auth?.isAdmin ? null : req.auth?.sessionIds ?? null;
+}
+
+export function requireSessionAccess(req, res, next) {
+  try {
+    assertSessionAccess(req, req.params.sessionId);
+    return next();
+  } catch (error) {
+    return sendError(res, error, 'Auth');
+  }
+}
+
+export function requireAdmin(req, res, next) {
+  if (req.auth?.isAdmin) return next();
+  return sendError(res, new AppError(403, 'This endpoint requires the master API key.'), 'Auth');
+}
+
+export const authenticate = createAuthenticate({ apiKey: config.apiKey, keyStore: apiKeyStore });
+export const qrPageAuth = createQrPageAuth({ apiKey: config.apiKey, keyStore: apiKeyStore });
